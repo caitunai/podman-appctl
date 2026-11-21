@@ -1,7 +1,8 @@
 import os
+import signal
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -335,6 +336,104 @@ class DeployTests(unittest.TestCase):
         prefix.unlink()
         self.assertEqual(self.deploy(), 'success')
         self.assertEqual(self.deploy(), 'noop')
+
+
+class LogsTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        appctl.save(self.root / 'demo/manifest.json', {
+            'files': {
+                'worker.container': {'kind': 'container', 'unit': 'worker.service', 'resource': 'systemd-worker'},
+                'api.container': {'kind': 'container', 'unit': 'api-custom.service', 'resource': 'api-container'},
+                'cache.volume': {'kind': 'volume', 'unit': 'cache-volume.service', 'resource': 'systemd-cache'},
+            },
+            'named_volumes': [],
+            'reload_pending': False,
+        })
+
+    def logs(self, *args, source=None, child_status=0):
+        source_args = ['--source', source] if source else []
+        executable = 'podman' if source == 'podman' else 'journalctl'
+        with patch.object(appctl, 'ROOT', self.root), patch.object(appctl, 'OUT', appctl.Output()), \
+                patch.object(appctl, 'configure'), patch.object(appctl.shutil, 'which', return_value=f'/test/{executable}') as which, \
+                patch.object(appctl.subprocess, 'run', return_value=SimpleNamespace(returncode=child_status)) as child:
+            status = appctl.main(['logs', 'demo', *args, *source_args, '--no-color'])
+        which.assert_called_once_with(executable)
+        child.assert_called_once()
+        self.assertFalse((self.root / 'deploy.lock').exists())
+        self.assertFalse((self.root / 'demo/history').exists())
+        return status, child.call_args
+
+    @staticmethod
+    def container(container_id, unit, driver):
+        return {'Id': container_id, 'Config': {'Labels': {'PODMAN_SYSTEMD_UNIT': unit}},
+                'HostConfig': {'LogConfig': {'Type': driver}}}
+
+    def test_project_logs_match_each_unit_and_container_as_a_pair(self):
+        status, journal = self.logs()
+        uid = f'_UID={os.getuid()}'
+        self.assertEqual(status, 0)
+        self.assertEqual(journal.args, ([
+            'journalctl', '--no-pager', '--output=with-unit', '--lines=100', '--',
+            uid, '_SYSTEMD_USER_UNIT=api-custom.service', 'CONTAINER_NAME=api-container',
+            '+', uid, '_SYSTEMD_USER_UNIT=worker.service', 'CONTAINER_NAME=systemd-worker',
+        ],))
+        self.assertEqual(set(journal.kwargs), {'env'})
+        self.assertEqual(journal.kwargs['env']['SYSTEMD_COLORS'], '0')
+
+    def test_single_service_follow_uses_line_count_and_time_range(self):
+        status, journal = self.logs('worker', '-f', '-n', '0', '--since', '1 hour ago')
+        self.assertEqual(status, 0)
+        self.assertEqual(journal.args, ([
+            'journalctl', '--no-pager', '--output=with-unit', '--lines=0', '--follow',
+            '--since=1 hour ago', '--', f'_UID={os.getuid()}',
+            '_SYSTEMD_USER_UNIT=worker.service', 'CONTAINER_NAME=systemd-worker',
+        ],))
+
+    def test_journal_errors_and_interrupt_have_appctl_exit_codes(self):
+        self.assertEqual(self.logs(child_status=2)[0], 1)
+        self.assertEqual(self.logs('-f', child_status=-signal.SIGINT)[0], 130)
+
+    def test_podman_logs_use_verified_ids_and_native_options_for_mixed_drivers(self):
+        ids = ['a' * 64, 'b' * 64]
+        containers = {
+            'api-container': self.container(ids[0], 'api-custom.service', 'k8s-file'),
+            'systemd-worker': self.container(ids[1], 'worker.service', 'journald'),
+        }
+        with patch.object(appctl, 'inspect_container', side_effect=containers.get):
+            status, child = self.logs('-f', '-n', '0', '--since', '30m', source='podman')
+        self.assertEqual(status, 0)
+        self.assertEqual(child.args, ([
+            'podman', 'logs', '--names', '--timestamps', '--tail=0', '--follow', '--since=30m', '--', *ids,
+        ],))
+
+    def test_podman_logs_skip_services_with_no_stored_output(self):
+        containers = {
+            'api-container': self.container('a' * 64, 'api-custom.service', 'k8s-file'),
+            'systemd-worker': self.container('b' * 64, 'worker.service', 'none'),
+        }
+        with patch.object(appctl, 'inspect_container', side_effect=containers.get), redirect_stderr(StringIO()) as stderr:
+            status, child = self.logs(source='podman')
+        self.assertEqual(status, 0)
+        self.assertEqual(child.args[0][-2:], ['--', 'a' * 64])
+        self.assertIn('Skipping worker: the none log driver stores no output', stderr.getvalue())
+
+    def test_podman_logs_require_a_container_owned_by_the_selected_service(self):
+        with patch.object(appctl, 'inspect_container', return_value=None):
+            with self.assertRaisesRegex(appctl.DeployError, 'container api-container no longer exists'):
+                self.logs('api', source='podman')
+        unrelated = self.container('a' * 64, 'other.service', 'k8s-file')
+        with patch.object(appctl, 'inspect_container', return_value=unrelated):
+            with self.assertRaisesRegex(appctl.DeployError, 'unverified owner: api-container'):
+                self.logs('api', source='podman')
+
+    def test_logs_reject_negative_line_counts(self):
+        with redirect_stderr(StringIO()) as stderr, self.assertRaises(SystemExit) as error:
+            appctl.parse_args(['logs', 'demo', '--lines', '-1'])
+        self.assertEqual(error.exception.code, 2)
+        self.assertIn('--lines must be non-negative', stderr.getvalue())
 
 
 if __name__ == '__main__':

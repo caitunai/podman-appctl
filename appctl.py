@@ -5,6 +5,7 @@
 #   appctl deploy APP [--pull] [--force]
 #   appctl {start,stop,restart,status} APP [SERVICE]
 #   appctl inspect APP [SERVICE]
+#   appctl logs APP [SERVICE] [-n N] [-f] [--since TIME] [--source journald|podman]
 #   appctl history APP [--limit N]
 #   appctl gc
 #   appctl --help | --version
@@ -41,6 +42,7 @@
 #     may read current bind files. Last successful deploy fingerprint is retained.
 #     status displays systemd state and actual container state; does not deploy.
 #   * inspect lists ports and mounts from the current Compose file.
+#   * logs reads deployed containers' stdout and stderr from journald or Podman.
 #   * JSON history for deploy/start/stop/restart, including failure and no-op;
 #     read-only status/history calls are not logged. No config values in history.
 #     Retain 90 days AND at most 100 attempts/project (constants below).
@@ -80,6 +82,7 @@ from pathlib import Path
 import re
 import shlex
 import shutil
+import signal
 from collections import Counter
 import subprocess
 from graphlib import CycleError, TopologicalSorter
@@ -827,7 +830,7 @@ def deploy(args, project, event):
         save(mp, manifest)
         return 'success'
 
-def selected_units(args, project):
+def managed_services(args, project):
     mp = project/'manifest.json'
     if not mp.is_file():
         fail(f'Project not managed: {args.app}; run appctl deploy first')
@@ -844,6 +847,12 @@ def selected_units(args, project):
         selected = {name:selected[name]}
     if not selected:
         fail(f'No managed container services in {args.app}')
+    return manifest, dict(sorted(selected.items()))
+
+
+def selected_units(args, project):
+    manifest, selected = managed_services(args, project)
+    files = manifest['files']
     # Verify every selected identity before any mutating systemctl call.
     other_manifests = dict(project_manifests(args.app))
     for other, other_manifest in other_manifests.items():
@@ -852,7 +861,7 @@ def selected_units(args, project):
                 if f == sel or m['unit'] == sm['unit'] or (m['kind'],m['resource']) == (sm['kind'],sm['resource']):
                     fail(f'Ownership conflict: {sel} / {other}')
     mounts = set()
-    for f,m in sorted(selected.items()):
+    for f,m in selected.items():
         dest = QUAD/f
         if dest.is_symlink(): fail(f'Refusing symlink: {dest}')
         info = unit_info(m['unit'])
@@ -878,7 +887,7 @@ def selected_units(args, project):
             conflicts = mounts & other_volumes
             if conflicts:
                 fail(f'Named volume owned by project {other}: ' + ', '.join(sorted(conflicts)))
-    return dict(sorted(selected.items()))
+    return selected
 
 
 def runtime_status(meta):
@@ -908,6 +917,65 @@ def show_status(args, project):
     running=sum(r[1].rstrip('*')=='active/running' and r[2]=='running' for r in rows)
     OUT.line('INFO',f'{running}/{len(rows)} services running; image tag for absent containers is last deployed')
     return 0
+
+
+def journal_log_matches(selected):
+    # Match each unit and container name as a pair, scoped to the deployment UID.
+    matches = []
+    uid = os.getuid()
+    for meta in selected.values():
+        if matches:
+            matches.append('+')
+        matches.extend((f'_UID={uid}', f'_SYSTEMD_USER_UNIT={meta["unit"]}',
+                        f'CONTAINER_NAME={meta["resource"]}'))
+    return matches
+
+
+def podman_log_ids(selected):
+    container_ids = []
+    skipped = []
+    for filename, meta in selected.items():
+        service = Path(filename).stem
+        container = assert_runtime(meta, True)
+        if container is None:
+            skipped.append(f'{service}: container {meta["resource"]} no longer exists')
+            continue
+        log_config = (container.get('HostConfig') or {}).get('LogConfig') or {}
+        if log_config.get('Type') == 'none':
+            skipped.append(f'{service}: the none log driver stores no output')
+            continue
+        container_id = container.get('Id')
+        if not container_id:
+            fail(f'Podman did not report a container ID for {service}')
+        container_ids.append(container_id)
+    if not container_ids:
+        fail('No Podman container logs available. ' + '. '.join(skipped))
+    for reason in skipped:
+        OUT.diagnostic(f'Skipping {reason}')
+    return container_ids
+
+
+def show_logs(args, project):
+    _, selected = managed_services(args, project)
+    if args.source == 'podman':
+        command = ['podman', 'logs', '--names', '--timestamps', f'--tail={args.lines}']
+        targets = podman_log_ids(selected)
+    else:
+        command = ['journalctl', '--no-pager', '--output=with-unit', f'--lines={args.lines}']
+        targets = journal_log_matches(selected)
+    if args.follow:
+        command.append('--follow')
+    if args.since is not None:
+        command.append(f'--since={args.since}')
+    command.extend(('--', *targets))
+    if OUT.verbose:
+        OUT.line('INFO', '$ ' + shlex.join(command))
+    env = dict(os.environ, SYSTEMD_COLORS='0') if args.source == 'journald' and not OUT.color else None
+    # Inherit the terminal streams so follow mode displays new entries immediately.
+    result = subprocess.run(command, env=env)
+    if result.returncode == -signal.SIGINT:
+        return 130
+    return int(result.returncode != 0)
 
 
 def display_port_mapping(value):
@@ -1049,11 +1117,18 @@ def parse_args(argv=None):
         ('restart', 'Restart deployed services'),
         ('status', 'Show systemd and Podman runtime state'),
         ('inspect', 'Show ports and mounts declared in compose.yml'),
+        ('logs', 'Show logs from deployed containers'),
     ]:
         p=subs.add_parser(action,help=helptext)
         p.add_argument('app',help=f'Project directory under APPCTL_BASE_DIR (default: {DEFAULT_BASE_DIR})')
         scope = 'all services in compose.yml' if action == 'inspect' else 'all owned container services'
         p.add_argument('service', nargs='?', help=f'Compose service name (default: {scope})')
+        if action == 'logs':
+            p.add_argument('-n', '--lines', type=int, default=100, help='Number of recent entries (default: 100)')
+            p.add_argument('-f', '--follow', action='store_true', help='Follow new entries')
+            p.add_argument('--since', metavar='TIME', help='Show entries since this time in the selected source format')
+            p.add_argument('--source', choices=('journald', 'podman'), default='journald',
+                           help='Read the journal or use Podman to read the configured driver (default: journald)')
     p=subs.add_parser('history',help='List retained deployment and operation history')
     p.add_argument('app')
     p.add_argument('--limit',type=int,default=20,help='Maximum entries to list (default: 20)')
@@ -1061,6 +1136,8 @@ def parse_args(argv=None):
     for sub in subs.choices.values(): output_flags(sub,argparse.SUPPRESS)
     args=parser.parse_args(argv)
     if getattr(args,'limit',1)<1: parser.error('--limit must be positive')
+    if args.command == 'logs' and args.lines < 0:
+        parser.error('--lines must be non-negative')
     for field in ('app','service'):
         val=getattr(args,field,None)
         if val is not None and not NAME.fullmatch(val): parser.error(f'Invalid {field} name')
@@ -1074,13 +1151,17 @@ def main(argv=None):
     configure()
     if OUT.verbose:
         OUT.line('INFO', f'User: {DEPLOY_USER} | Base: {BASE} | Podman target: {PODMAN_VERSION}')
-    required = ['podman', 'systemctl'] if args.command not in ('history', 'gc', 'inspect') else []
+    required = ['podman', 'systemctl'] if args.command in ('deploy', 'start', 'stop', 'restart', 'status') else []
     if args.command in ('deploy', 'inspect'):
         required.append('podlet')
+    if args.command == 'logs':
+        required.append('podman' if args.source == 'podman' else 'journalctl')
     for cmd in required:
         if not shutil.which(cmd): fail(f'Required command not found: {cmd}')
     if args.command == 'inspect':
         return show_compose_resources(args)
+    if args.command == 'logs':
+        return show_logs(args, ROOT / args.app)
     os.umask(0o077); ROOT.mkdir(parents=True,exist_ok=True)
     os.environ.setdefault('REGISTRY_AUTH_FILE',str(HOME/'.config/containers/auth.json'))
     if args.command not in ('status','history'):

@@ -205,6 +205,7 @@ Deploy the project and verify it:
 appctl deploy demo
 appctl status demo
 curl http://127.0.0.1:18080/
+appctl logs demo -n 20
 ```
 
 Modify `default.conf` and run `appctl deploy demo` again. appctl detects the file content change and restarts the affected service. If nothing has changed and the expected container is running, deployment is skipped.
@@ -238,6 +239,7 @@ appctl stop APP [SERVICE]
 appctl restart APP [SERVICE]
 appctl status APP [SERVICE]
 appctl inspect APP [SERVICE]
+appctl logs APP [SERVICE] [-n N] [-f] [--since TIME] [--source journald|podman]
 appctl history APP [--limit N]
 appctl gc
 appctl --help
@@ -254,6 +256,7 @@ appctl --version
 | `restart` | Restart already-deployed services using installed definitions. |
 | `status` | Show systemd state, container state, image reference, and abbreviated image ID. |
 | `inspect` | Show ports and mounts declared in the current Compose file for a project or one service. |
+| `logs` | Show or follow container output from a deployed project or one service, using journald or Podman. |
 | `history` | List recent deployment and lifecycle operations (20 entries by default). |
 | `gc` | Clean expired and excess history and old temporary state files across all projects. |
 
@@ -280,6 +283,28 @@ appctl inspect myapp myapp-api    # One service
 `inspect` uses Podlet to read the current `compose.yml` and works before the first deployment. The port table distinguishes host mappings declared with `ports` from container ports declared with `expose`. It also indicates host networking. The mount table shows the source, container path, and configured options for named volumes, anonymous volumes, bind-mounted files or directories, tmpfs, and mounted secrets.
 
 The report reflects configuration declarations. Host ports assigned automatically by Podman and ports opened by the application at runtime depend on the running container. Use the same project and service names as with `deploy` and `status`.
+
+### View container logs
+
+```bash
+appctl logs myapp
+appctl logs myapp myapp-api -n 50
+appctl logs myapp myapp-api -f
+appctl logs myapp --since '1 hour ago'
+```
+
+By default, `logs` reads stdout and stderr recorded by Podman's `journald` log driver. It shows the latest 100 entries across the selected services in chronological order with their systemd unit names. The deployment account needs read access to the journals containing those entries.
+
+The command uses the project's deployed service manifest. Journald entries remain available for a stopped or recreated container as long as the journal retains them. Both sources support `-f` to stream new entries and `-n 0 -f` to start with only new output. Press Ctrl+C to leave follow mode.
+
+For a service using `k8s-file` or its `json-file` alias, choose `--source podman` to read through `podman logs`. This source can also read a project with mixed log drivers when the containers still exist. The line limit applies per container, and `--since` accepts Podman's time formats, including durations such as `1h` and RFC 3339 timestamps.
+
+```bash
+appctl logs myapp --source podman
+appctl logs myapp myapp-api --source podman -f --since 1h
+```
+
+Podman needs the container and its retained logs to read file-based output. The command reports missing containers and services using the `none` driver while showing logs from the other available services. In follow mode, run the command again after a deployment replaces a container to follow the new container.
 
 ### Output options
 
@@ -380,6 +405,7 @@ appctl is intentionally not a build system and does not implement remote orchest
 ```bash
 appctl deploy myapp --verbose
 systemctl --user status myapp-api.service
+appctl logs myapp myapp-api -n 80
 journalctl --user -u myapp-api.service -n 80 --no-pager
 podman ps -a
 ```
