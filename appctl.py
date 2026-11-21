@@ -4,6 +4,7 @@
 # Usage (run as the configured non-root deployment account):
 #   appctl deploy APP [--pull] [--force]
 #   appctl {start,stop,restart,status} APP [SERVICE]
+#   appctl stats APP [SERVICE] [--no-stream] [--interval SECONDS | --processes]
 #   appctl inspect APP [SERVICE]
 #   appctl logs APP [SERVICE] [-n N] [-f] [--since TIME] [--source journald|podman]
 #   appctl history APP [--limit N]
@@ -41,6 +42,7 @@
 #   * start/restart use installed unit definitions, not pending Compose changes;
 #     may read current bind files. Last successful deploy fingerprint is retained.
 #     status displays systemd state and actual container state; does not deploy.
+#   * stats shows Podman resource usage or a snapshot of container processes.
 #   * inspect lists ports and mounts from the current Compose file.
 #   * logs reads deployed containers' stdout and stderr from journald or Podman.
 #   * JSON history for deploy/start/stop/restart, including failure and no-op;
@@ -146,7 +148,7 @@ class Output:
             # Preserve diagnostic context on failure, without copying raw child
             # output into persistent history (it may contain sensitive values).
             self.diagnostic(exc.details)
-    def table(self, headers, rows, colored=None):
+    def table(self, headers, rows, colored=None, *, stream=None):
         widths = [max(len(str(r[i])) for r in [headers, *rows]) for i in range(len(headers))]
         def format_row(r, header=False):
             values = []
@@ -155,9 +157,9 @@ class Output:
                 code = '1' if header else (colored or {}).get(str(v))
                 values.append(self.style(raw, code) if code else raw)
             return '  ' + '  '.join(values).rstrip()
-        print(format_row(headers, True))
-        print('  ' + '  '.join('-' * w for w in widths))
-        for r in rows: print(format_row(r))
+        print(format_row(headers, True), file=stream)
+        print('  ' + '  '.join('-' * w for w in widths), file=stream)
+        for r in rows: print(format_row(r), file=stream)
     def summary(self, result, seconds, events):
         counts = Counter(e['action'] for e in events)
         fields = [('restarted','updated'),('started','started'),('stopped','stopped'),
@@ -212,6 +214,17 @@ def run(*args, ok=(0,), capture=True, env=None):
     return p
 
 def system(*args, **kw): return run('systemctl', '--user', *args, **kw)
+
+
+def stream_command(command, env=None):
+    if OUT.verbose:
+        OUT.line('INFO', '$ ' + shlex.join(command))
+    # Inherit stdout and stderr so native output can be displayed immediately.
+    result = subprocess.run(command, env=env)
+    if result.returncode == -signal.SIGINT:
+        return 130
+    return int(result.returncode != 0)
+
 
 def atomic(path, data, mode=0o600):
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -667,6 +680,12 @@ def verify_services(containers, plans):
             fail(f'Container not running expected image: {meta["resource"]}')
 
 
+def invalidate_service(state, filename):
+    previous = state.pop(filename, {})
+    if 'deployed_at' in previous:
+        state[filename] = {'deployed_at': previous['deployed_at']}
+
+
 def apply_services(containers, units, order, plans, updates, state, state_path, event):
     filenames = {meta['unit']: filename for filename, meta in containers.items()}
     actions = {}
@@ -687,7 +706,7 @@ def apply_services(containers, units, order, plans, updates, state, state_path, 
         if running and invocation and info['InvocationID'] != units[unit].get('InvocationID'):
             continue
         if filename not in updates:
-            state.pop(filename, None)
+            invalidate_service(state, filename)
             save(state_path, state)
         event(action + '_begin', unit=unit, image=plan['image'], image_id=plan['image_id'])
         system('restart' if info.get('ActiveState') == 'active' else 'start', unit, capture=False)
@@ -755,7 +774,7 @@ def deploy(args, project, event):
             reasons=[]
             details=[]
             if args.force: reasons.append('forced')
-            if not prev:
+            if not prev.get('fingerprint'):
                 reasons.append('new service' if f not in owned and not same else 'incomplete deployment state')
                 if inputs['dropins']: reload_needed=True
             elif prev.get('fingerprint')!=fp:
@@ -790,13 +809,13 @@ def deploy(args, project, event):
             preflight_generator(desired, desired_paths, stale)
         OUT.phase('[3/4] Apply changes')
         # Reserve names and persist a reload marker BEFORE modifying anything.
-        manifest = {'files': {**owned, **desired}, 'named_volumes': sorted(claims),
+        manifest = {**manifest, 'files': {**owned, **desired}, 'named_volumes': sorted(claims),
                     'reload_pending': bool(reload_needed or stale)}
         save(mp,manifest)
         container_units, order = install_quadlets(desired, desired_paths, changed, stale, reload_needed, event)
         # The replacement units are loaded. Old definitions stay available until
         # the replacement is running, even when it needs to reuse a released port.
-        for f in updates: state.pop(f,None)
+        for f in updates: invalidate_service(state, f)
         save(sp,state)
         for m in stale.values():
             event('remove_begin',unit=m['unit'])
@@ -827,8 +846,15 @@ def deploy(args, project, event):
         # State contains only desired, successfully deployed services.
         state={f:v for f,v in state.items() if f in containers}; save(sp,state)
         manifest['reload_pending'] = False
+        manifest['deployed_at'] = now()
         save(mp, manifest)
         return 'success'
+
+
+def container_services(manifest):
+    return {filename: meta for filename, meta in manifest.get('files', {}).items()
+            if meta['kind'] == 'container'}
+
 
 def managed_services(args, project):
     mp = project/'manifest.json'
@@ -837,8 +863,7 @@ def managed_services(args, project):
     manifest = load_manifest(mp)
     if manifest.get('reload_pending') and args.command in ('start','restart'):
         fail('Previous deployment incomplete; run appctl deploy first')
-    files = manifest['files']
-    selected = {f:m for f,m in files.items() if m['kind']=='container'}
+    selected = container_services(manifest)
     if args.service:
         name = args.service + '.container'
         if name not in selected:
@@ -850,7 +875,7 @@ def managed_services(args, project):
     return manifest, dict(sorted(selected.items()))
 
 
-def selected_units(args, project):
+def selected_units(args, project, runtime=None):
     manifest, selected = managed_services(args, project)
     files = manifest['files']
     # Verify every selected identity before any mutating systemctl call.
@@ -877,7 +902,9 @@ def selected_units(args, project):
                 # Prevent local identity/mount/lifecycle overrides; no file hashing here.
                 dropins(dest)
                 mounts.update(named_volumes(parse(dest)['Container']))
-        assert_runtime(m, True)
+        container = assert_runtime(m, True)
+        if runtime is not None:
+            runtime[f] = (info, container)
     if mounts:
         unowned = mounts - (set(manifest['named_volumes']) | volume_names(files))
         if unowned:
@@ -896,13 +923,105 @@ def runtime_status(meta):
     return info, obj
 
 
+def parse_timestamp(value):
+    if not isinstance(value, str) or not value:
+        return None
+    # Podman emits RFC 3339 with up to nanosecond precision. Python 3.9
+    # needs an explicit UTC offset and a supported fractional width.
+    value = re.sub(r'\.(\d+)', lambda match: '.' + match[1][:6].ljust(6, '0'), value)
+    if value.endswith('Z'):
+        value = value[:-1] + '+00:00'
+    try:
+        timestamp = dt.datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return timestamp if timestamp.tzinfo is not None and timestamp.year > 1 else None
+
+
+def format_deployed(timestamp):
+    return timestamp.astimezone(dt.timezone.utc).strftime('%Y-%m-%d %H:%M:%S') if timestamp else '-'
+
+
+def format_uptime(seconds):
+    if seconds is None:
+        return '-'
+    minutes, seconds = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    days, hours = divmod(hours, 24)
+    return ' '.join(f'{value}{unit}' for value, unit in zip((days, hours, minutes, seconds), 'dhms') if value) or '0s'
+
+
+def latest_deployment(project, manifest, service_dates):
+    timestamp = parse_timestamp(manifest.get('deployed_at'))
+    if timestamp:
+        return timestamp
+    # Existing deployments already have these records even if their manifest
+    # predates the project timestamp. History may have been pruned.
+    for path in sorted((project / 'history').glob('*.json'), reverse=True):
+        try:
+            record = load(path, {})
+        except (OSError, ValueError):
+            continue
+        if isinstance(record, dict) and record.get('command') == 'deploy' and record.get('result') == 'success':
+            timestamp = parse_timestamp(record.get('finished_at'))
+            if timestamp:
+                return timestamp
+    return max((date for date in service_dates.values() if date is not None), default=None)
+
+
+def deployment_times(project, manifest=None, containers=None):
+    if manifest is None:
+        try:
+            manifest = load_manifest(project / 'manifest.json')
+        except (DeployError, OSError, ValueError):
+            manifest = {}
+    try:
+        state = load(project / 'state.json', {})
+    except (OSError, ValueError):
+        state = {}
+    services = container_services(manifest)
+    containers = dict(containers or {})
+    missing = services.keys() - containers.keys()
+    if missing and shutil.which('podman'):
+        for filename in sorted(missing):
+            try:
+                containers[filename] = assert_runtime(services[filename], True)
+            except (DeployError, OSError, ValueError, IndexError):
+                continue
+    observed = time.time()
+    deployed = {}
+    uptimes = {}
+    for filename in services:
+        deployed[filename] = parse_timestamp(state.get(filename, {}).get('deployed_at'))
+        runtime = (containers.get(filename) or {}).get('State') or {}
+        started = parse_timestamp(runtime.get('StartedAt')) if runtime.get('Running') else None
+        uptimes[filename] = max(0, int(observed - started.timestamp())) if started else None
+    project_deployed = latest_deployment(project, manifest, deployed)
+    project_uptime = min(uptimes.values()) if uptimes and None not in uptimes.values() else None
+    project_times = format_deployed(project_deployed), format_uptime(project_uptime)
+    service_times = {filename: (format_deployed(deployed[filename]), format_uptime(uptimes[filename]))
+                     for filename in services}
+    return state, project_times, service_times
+
+
+def show_deployment_times(app, project_times, service_times, filenames=(), *, stream=None):
+    deployed, uptime = project_times
+    print(f'  Project {app}  |  Deployed (UTC) {deployed}  |  Uptime {uptime}', file=stream, flush=True)
+    rows = [(Path(filename).stem, *service_times.get(filename, ('-', '-'))) for filename in filenames]
+    if rows:
+        OUT.table(('SERVICE', 'DEPLOYED (UTC)', 'UPTIME'), rows, stream=stream)
+
+
 def show_status(args, project):
-    selected = selected_units(args, project)
+    runtime = {}
+    selected = selected_units(args, project, runtime)
+    deployed, project_times, service_times = deployment_times(
+        project, containers={filename: obj for filename, (_, obj) in runtime.items()})
     OUT.header('status',args.app,args.service)
+    show_deployment_times(args.app, project_times, service_times)
     rows = []
-    deployed=load(project/'state.json',{})
-    for f,m in selected.items():
-        info,obj = runtime_status(m)
+    for f in selected:
+        info, obj = runtime[f]
         sd = info.get('ActiveState','unknown')+'/'+info.get('SubState','unknown')
         if info.get('LoadState') != 'loaded': sd = info.get('LoadState','unknown')
         if info.get('NeedDaemonReload')=='yes': sd += '*'
@@ -910,13 +1029,59 @@ def show_status(args, project):
         cs = ('running' if state.get('Running') else state.get('Status','stopped')) if obj else 'absent'
         iid = (obj or {}).get('Image','').removeprefix('sha256:')[:12] or '-'
         image=(obj or {}).get('ImageName') or deployed.get(f,{}).get('image','-')
-        rows.append((Path(f).stem,sd,cs,short_image(image),iid))
-    OUT.table(('SERVICE','SYSTEMD','CONTAINER','IMAGE','IMAGE ID'),rows,
+        rows.append((Path(f).stem, sd, cs, short_image(image), iid, *service_times.get(f, ('-', '-'))))
+    OUT.table(('SERVICE', 'SYSTEMD', 'CONTAINER', 'IMAGE', 'IMAGE ID', 'DEPLOYED (UTC)', 'UPTIME'), rows,
               {'active/running':'32','running':'32','inactive/dead':'2','absent':'2','failed/failed':'31','not-found':'33'})
     if any('*' in r[1] for r in rows): OUT.line('WARN','* systemd reports daemon-reload needed')
     running=sum(r[1].rstrip('*')=='active/running' and r[2]=='running' for r in rows)
     OUT.line('INFO',f'{running}/{len(rows)} services running; image tag for absent containers is last deployed')
     return 0
+
+
+def require_container_id(container, service):
+    container_id = container.get('Id')
+    if not container_id:
+        fail(f'Podman did not report a container ID for {service}')
+    return container_id
+
+
+def show_stats(args, project):
+    _, selected = managed_services(args, project)
+    targets = {}
+    for filename, meta in selected.items():
+        service = Path(filename).stem
+        container = assert_runtime(meta, True)
+        if container is None:
+            OUT.diagnostic(f'Skipping {service}: no container named {meta["resource"]}')
+            continue
+        state = container.get('State') or {}
+        if not state.get('Running'):
+            OUT.diagnostic(f'Skipping {service}: container is {state.get("Status") or "not running"}')
+            continue
+        targets[service] = require_container_id(container, service)
+    if not targets:
+        fail(f'No running containers in {args.app}')
+
+    if args.processes:
+        result = 0
+        for service, container_id in targets.items():
+            OUT.phase(service)
+            status = stream_command(['podman', 'top', '--', container_id,
+                                     'user', 'pid', 'ppid', 'state', 'pcpu', 'etime', 'args'])
+            if status == 130:
+                return status
+            result = max(result, status)
+        return result
+
+    command = ['podman', 'stats']
+    if args.no_stream:
+        command.append('--no-stream')
+    if args.no_stream or not OUT.color:
+        command.append('--no-reset')
+    if args.interval is not None:
+        command.append(f'--interval={args.interval}')
+    command.extend(('--', *targets.values()))
+    return stream_command(command)
 
 
 def journal_log_matches(selected):
@@ -931,12 +1096,13 @@ def journal_log_matches(selected):
     return matches
 
 
-def podman_log_ids(selected):
+def podman_log_ids(selected, containers):
     container_ids = []
     skipped = []
     for filename, meta in selected.items():
         service = Path(filename).stem
         container = assert_runtime(meta, True)
+        containers[filename] = container
         if container is None:
             skipped.append(f'{service}: container {meta["resource"]} no longer exists')
             continue
@@ -944,10 +1110,7 @@ def podman_log_ids(selected):
         if log_config.get('Type') == 'none':
             skipped.append(f'{service}: the none log driver stores no output')
             continue
-        container_id = container.get('Id')
-        if not container_id:
-            fail(f'Podman did not report a container ID for {service}')
-        container_ids.append(container_id)
+        container_ids.append(require_container_id(container, service))
     if not container_ids:
         fail('No Podman container logs available. ' + '. '.join(skipped))
     for reason in skipped:
@@ -956,10 +1119,11 @@ def podman_log_ids(selected):
 
 
 def show_logs(args, project):
-    _, selected = managed_services(args, project)
+    manifest, selected = managed_services(args, project)
+    containers = {}
     if args.source == 'podman':
         command = ['podman', 'logs', '--names', '--timestamps', f'--tail={args.lines}']
-        targets = podman_log_ids(selected)
+        targets = podman_log_ids(selected, containers)
     else:
         command = ['journalctl', '--no-pager', '--output=with-unit', f'--lines={args.lines}']
         targets = journal_log_matches(selected)
@@ -968,14 +1132,10 @@ def show_logs(args, project):
     if args.since is not None:
         command.append(f'--since={args.since}')
     command.extend(('--', *targets))
-    if OUT.verbose:
-        OUT.line('INFO', '$ ' + shlex.join(command))
+    _, project_times, service_times = deployment_times(project, manifest, containers)
+    show_deployment_times(args.app, project_times, service_times, selected, stream=sys.stderr)
     env = dict(os.environ, SYSTEMD_COLORS='0') if args.source == 'journald' and not OUT.color else None
-    # Inherit the terminal streams so follow mode displays new entries immediately.
-    result = subprocess.run(command, env=env)
-    if result.returncode == -signal.SIGINT:
-        return 130
-    return int(result.returncode != 0)
+    return stream_command(command, env)
 
 
 def display_port_mapping(value):
@@ -1052,7 +1212,9 @@ def show_compose_resources(args):
                 service_mounts.append((service, kind, source, target or '-', options or '-'))
             mounts.extend(service_mounts or [(service, 'none', '-', '-', '-')])
 
+    _, project_times, service_times = deployment_times(ROOT / args.app)
     OUT.header('inspect', args.app, args.service)
+    show_deployment_times(args.app, project_times, service_times, sorted(path.name for path in services.values()))
     OUT.phase('Ports')
     OUT.table(('SERVICE', 'KIND', 'PORT / MAPPING'), ports)
     OUT.phase('Mounts')
@@ -1116,6 +1278,7 @@ def parse_args(argv=None):
         ('stop', 'Temporarily stop deployed services'),
         ('restart', 'Restart deployed services'),
         ('status', 'Show systemd and Podman runtime state'),
+        ('stats', 'Show resource usage or processes for deployed containers'),
         ('inspect', 'Show ports and mounts declared in compose.yml'),
         ('logs', 'Show logs from deployed containers'),
     ]:
@@ -1123,6 +1286,12 @@ def parse_args(argv=None):
         p.add_argument('app',help=f'Project directory under APPCTL_BASE_DIR (default: {DEFAULT_BASE_DIR})')
         scope = 'all services in compose.yml' if action == 'inspect' else 'all owned container services'
         p.add_argument('service', nargs='?', help=f'Compose service name (default: {scope})')
+        if action == 'stats':
+            p.add_argument('--no-stream', action='store_true', help='Show one resource usage sample')
+            mode = p.add_mutually_exclusive_group()
+            mode.add_argument('-i', '--interval', type=int, metavar='SECONDS',
+                              help='Seconds between resource usage samples (Podman defaults to 5)')
+            mode.add_argument('--processes', action='store_true', help='List individual processes in a snapshot')
         if action == 'logs':
             p.add_argument('-n', '--lines', type=int, default=100, help='Number of recent entries (default: 100)')
             p.add_argument('-f', '--follow', action='store_true', help='Follow new entries')
@@ -1138,6 +1307,8 @@ def parse_args(argv=None):
     if getattr(args,'limit',1)<1: parser.error('--limit must be positive')
     if args.command == 'logs' and args.lines < 0:
         parser.error('--lines must be non-negative')
+    if args.command == 'stats' and args.interval is not None and args.interval < 1:
+        parser.error('--interval must be positive')
     for field in ('app','service'):
         val=getattr(args,field,None)
         if val is not None and not NAME.fullmatch(val): parser.error(f'Invalid {field} name')
@@ -1156,12 +1327,16 @@ def main(argv=None):
         required.append('podlet')
     if args.command == 'logs':
         required.append('podman' if args.source == 'podman' else 'journalctl')
+    if args.command == 'stats':
+        required.append('podman')
     for cmd in required:
         if not shutil.which(cmd): fail(f'Required command not found: {cmd}')
     if args.command == 'inspect':
         return show_compose_resources(args)
     if args.command == 'logs':
         return show_logs(args, ROOT / args.app)
+    if args.command == 'stats':
+        return show_stats(args, ROOT / args.app)
     os.umask(0o077); ROOT.mkdir(parents=True,exist_ok=True)
     os.environ.setdefault('REGISTRY_AUTH_FILE',str(HOME/'.config/containers/auth.json'))
     if args.command not in ('status','history'):
@@ -1178,6 +1353,9 @@ def main(argv=None):
         project=ROOT/args.app
         if args.command=='history':
             OUT.header('history',args.app)
+            _, project_times, service_times = deployment_times(project)
+            show_deployment_times(args.app, project_times, service_times, sorted(service_times))
+            OUT.phase('Operation history')
             rows=[]
             for p in sorted((project/'history').glob('*.json'),reverse=True)[:args.limit]:
                 h=load(p,{})

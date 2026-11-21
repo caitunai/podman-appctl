@@ -238,6 +238,7 @@ appctl start APP [SERVICE]
 appctl stop APP [SERVICE]
 appctl restart APP [SERVICE]
 appctl status APP [SERVICE]
+appctl stats APP [SERVICE] [--no-stream] [--interval SECONDS | --processes]
 appctl inspect APP [SERVICE]
 appctl logs APP [SERVICE] [-n N] [-f] [--since TIME] [--source journald|podman]
 appctl history APP [--limit N]
@@ -254,7 +255,8 @@ appctl --version
 | `start` | Start already-deployed services using installed Quadlet definitions. |
 | `stop` | Temporarily stop already-deployed services without deleting deployment definitions or application data. |
 | `restart` | Restart already-deployed services using installed definitions. |
-| `status` | Show systemd state, container state, image reference, and abbreviated image ID. |
+| `status` | Show systemd and container state, images, deployment times, and uptime. |
+| `stats` | Stream Podman resource usage or list individual processes for deployed containers. |
 | `inspect` | Show ports and mounts declared in the current Compose file for a project or one service. |
 | `logs` | Show or follow container output from a deployed project or one service, using journald or Podman. |
 | `history` | List recent deployment and lifecycle operations (20 entries by default). |
@@ -269,9 +271,29 @@ appctl stop myapp myapp-api
 appctl start myapp myapp-api
 appctl restart myapp
 appctl status myapp
+appctl stats myapp --no-stream
 appctl history myapp --limit 50
 appctl gc
 ```
+
+### Deployment time and uptime
+
+`status`, `inspect`, `logs`, and `history` show the project's deployment time and uptime alongside the selected services' times. Deployment timestamps are in UTC. The project timestamp records the latest successful deployment that applied changes. Each service keeps its own last successful deployment time across lifecycle commands and no-op deploys.
+
+Service uptime measures how long the current container has been running. Project uptime measures how long all deployed services have been running together, starting at the most recent container start. A dash indicates a stopped service or timing information that is unavailable. The `logs` command writes the timing summary to stderr and streams the container logs on stdout.
+
+### Monitor resource usage and processes
+
+```bash
+appctl stats myapp                          # Live stats for the entire project
+appctl stats myapp myapp-api --interval 2   # Live stats for one service
+appctl stats myapp --no-stream              # Collect one sample
+appctl stats myapp myapp-api --processes    # List individual processes
+```
+
+Resource statistics come from `podman stats` and include CPU, memory, block I/O, and PID counts. Podman refreshes every five seconds by default. Press Ctrl+C to stop the stream. Rootless statistics require cgroups v2, and the network I/O column may be unavailable.
+
+`--processes` takes a snapshot with `podman top`. Each service's list contains the user, PID, parent PID, process state, CPU usage, elapsed time, and command. Both modes operate on running containers from the deployment manifest and report any selected services they skip.
 
 ### Inspect Compose ports and mounts
 
@@ -376,7 +398,7 @@ By design, appctl rejects unmanaged Quadlets or runtime objects with conflicting
 ~/.local/state/appctl/         # or $XDG_STATE_HOME/appctl
 ├── deploy.lock
 └── demo/
-    ├── manifest.json          # owned files, units and resource identities
+    ├── manifest.json          # owned resources and project deployment time
     ├── state.json             # last successful deployment state per service
     └── history/               # structured operation records
         └── <timestamp>-<id>.json

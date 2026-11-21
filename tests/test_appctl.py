@@ -3,6 +3,7 @@ import signal
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime, timezone
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -30,6 +31,7 @@ class DeployTests(unittest.TestCase):
         self.desired = {}
         self.loaded = {}
         self.running = {}
+        self.started_at = {}
         self.invocations = {}
         self.jobs = set()
         self.volumes = set()
@@ -80,7 +82,8 @@ class DeployTests(unittest.TestCase):
     def inspect_container(self, name):
         for unit, container in self.running.items():
             if container == name:
-                return {'Image': 'sha256:test-image', 'State': {'Running': True},
+                return {'Image': 'sha256:test-image',
+                        'State': {'Running': True, 'StartedAt': self.started_at.get(unit)},
                         'Config': {'Labels': {'PODMAN_SYSTEMD_UNIT': unit}}}
         return None
 
@@ -88,6 +91,7 @@ class DeployTests(unittest.TestCase):
         loaded = self.loaded.get(unit, {})
         return {**loaded, 'LoadState': 'loaded' if loaded else 'not-found',
                 'ActiveState': 'active' if unit in self.running else 'inactive',
+                'SubState': 'running' if unit in self.running else 'dead',
                 'NeedDaemonReload': 'no', 'InvocationID': self.invocations.get(unit, ''),
                 'Job': '1' if unit in self.jobs else ''}
 
@@ -301,13 +305,55 @@ class DeployTests(unittest.TestCase):
 
     def test_end_verification_checks_services_previously_skipped(self):
         self.desired = {'a-web.container': quadlet(), 'z-worker.container': quadlet()}
-        self.deploy()
+        with patch.object(appctl, 'now', return_value='2026-11-21T08:00:00+00:00'):
+            self.deploy()
         self.desired['z-worker.container'] = quadlet('Environment=MODE=two\n')
         self.stops_on_start['z-worker.service'] = ('a-web.service',)
         with self.assertRaisesRegex(appctl.DeployError, 'Service not active: a-web.service'):
             self.deploy()
         deployed = appctl.load(self.state / 'demo/state.json', {})
-        self.assertNotIn('z-worker.container', deployed)
+        self.assertEqual(deployed['z-worker.container'], {'deployed_at': '2026-11-21T08:00:00+00:00'})
+
+    def test_project_deployment_time_updates_on_removal_but_not_on_noop(self):
+        self.desired = {'web.container': quadlet(), 'worker.container': quadlet()}
+        initial = '2026-11-20T08:00:00+00:00'
+        later = '2026-11-21T08:00:00+00:00'
+        with patch.object(appctl, 'now', return_value=initial):
+            self.assertEqual(self.deploy(), 'success')
+        with patch.object(appctl, 'now', return_value=later):
+            self.assertEqual(self.deploy(), 'noop')
+            self.assertEqual(self.manifest()['deployed_at'], initial)
+            del self.desired['worker.container']
+            self.assertEqual(self.deploy(), 'success')
+        self.assertEqual(self.manifest()['deployed_at'], later)
+        deployed = appctl.load(self.state / 'demo/state.json', {})
+        self.assertEqual(deployed['web.container']['deployed_at'], initial)
+
+    def test_status_inspect_and_history_show_current_project_and_service_times(self):
+        self.desired = {'web.container': quadlet(), 'worker.container': quadlet()}
+        with patch.object(appctl, 'now', return_value='2026-11-20T08:00:00+00:00'):
+            self.deploy()
+        self.started_at = {
+            'web.service': '2026-11-21T07:00:00.123456789Z',
+            'worker.service': '2026-11-21T15:58:00+08:00',
+        }
+        observed = datetime(2026, 11, 21, 8, 0, 0, tzinfo=timezone.utc).timestamp()
+        for command in (['status', 'demo', 'web'], ['inspect', 'demo', 'web'], ['history', 'demo']):
+            with self.subTest(command=command), redirect_stdout(StringIO()) as output, \
+                    patch.object(appctl, 'OUT', appctl.Output()), patch.object(appctl, 'configure'), \
+                    patch.object(appctl.shutil, 'which', return_value='/test/command'), \
+                    patch.object(appctl.time, 'time', return_value=observed), patch.object(appctl.os, 'umask'), \
+                    patch.dict(os.environ):
+                self.assertEqual(appctl.main([*command, '--no-color']), 0)
+            report = output.getvalue()
+            self.assertIn('Project demo  |  Deployed (UTC) 2026-11-20 08:00:00  |  Uptime 2m', report)
+            self.assertRegex(report, r'web[^\n]+2026-11-20 08:00:00\s+59m 59s')
+        self.running.pop('worker.service')
+        with patch.object(appctl.time, 'time', return_value=observed), \
+                patch.object(appctl.shutil, 'which', return_value='/test/podman'):
+            _, project_times, service_times = appctl.deployment_times(self.state / 'demo')
+        self.assertEqual(project_times, ('2026-11-20 08:00:00', '-'))
+        self.assertEqual(service_times['worker.container'], ('2026-11-20 08:00:00', '-'))
 
     def test_anonymous_volume_and_unrelated_multiline_quadlet_are_accepted(self):
         continuation = '\\' + '\n'
@@ -338,7 +384,7 @@ class DeployTests(unittest.TestCase):
         self.assertEqual(self.deploy(), 'noop')
 
 
-class LogsTests(unittest.TestCase):
+class RuntimeReadTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -353,18 +399,24 @@ class LogsTests(unittest.TestCase):
             'reload_pending': False,
         })
 
-    def logs(self, *args, source=None, child_status=0):
+    def logs(self, *args, source=None, child_status=0, podman_available=False):
         source_args = ['--source', source] if source else []
         executable = 'podman' if source == 'podman' else 'journalctl'
+        binaries = {executable}
+        if podman_available:
+            binaries.add('podman')
+        history = self.root / 'demo/history'
+        had_history = history.exists()
         with patch.object(appctl, 'ROOT', self.root), patch.object(appctl, 'OUT', appctl.Output()), \
-                patch.object(appctl, 'configure'), patch.object(appctl.shutil, 'which', return_value=f'/test/{executable}') as which, \
-                patch.object(appctl.subprocess, 'run', return_value=SimpleNamespace(returncode=child_status)) as child:
+                patch.object(appctl, 'configure'), patch.object(appctl.shutil, 'which', side_effect=lambda name: name if name in binaries else None) as which, \
+                patch.object(appctl.subprocess, 'run', return_value=SimpleNamespace(returncode=child_status)) as child, \
+                redirect_stdout(StringIO()) as stdout, redirect_stderr(StringIO()) as stderr:
             status = appctl.main(['logs', 'demo', *args, *source_args, '--no-color'])
-        which.assert_called_once_with(executable)
+        self.assertEqual(which.call_args_list[0].args, (executable,))
         child.assert_called_once()
         self.assertFalse((self.root / 'deploy.lock').exists())
-        self.assertFalse((self.root / 'demo/history').exists())
-        return status, child.call_args
+        self.assertEqual(history.exists(), had_history)
+        return status, child.call_args, stdout.getvalue(), stderr.getvalue()
 
     @staticmethod
     def container(container_id, unit, driver):
@@ -372,7 +424,7 @@ class LogsTests(unittest.TestCase):
                 'HostConfig': {'LogConfig': {'Type': driver}}}
 
     def test_project_logs_match_each_unit_and_container_as_a_pair(self):
-        status, journal = self.logs()
+        status, journal, *_ = self.logs()
         uid = f'_UID={os.getuid()}'
         self.assertEqual(status, 0)
         self.assertEqual(journal.args, ([
@@ -384,7 +436,7 @@ class LogsTests(unittest.TestCase):
         self.assertEqual(journal.kwargs['env']['SYSTEMD_COLORS'], '0')
 
     def test_single_service_follow_uses_line_count_and_time_range(self):
-        status, journal = self.logs('worker', '-f', '-n', '0', '--since', '1 hour ago')
+        status, journal, *_ = self.logs('worker', '-f', '-n', '0', '--since', '1 hour ago')
         self.assertEqual(status, 0)
         self.assertEqual(journal.args, ([
             'journalctl', '--no-pager', '--output=with-unit', '--lines=0', '--follow',
@@ -396,6 +448,35 @@ class LogsTests(unittest.TestCase):
         self.assertEqual(self.logs(child_status=2)[0], 1)
         self.assertEqual(self.logs('-f', child_status=-signal.SIGINT)[0], 130)
 
+    def test_logs_show_existing_deploy_times_on_stderr_and_keep_stdout_for_logs(self):
+        project = self.root / 'demo'
+        appctl.save(project / 'state.json', {
+            'api.container': {'deployed_at': '2026-11-20T08:00:00+00:00'},
+            'worker.container': {'deployed_at': '2026-11-20T07:00:00+00:00'},
+        })
+        appctl.save(project / 'history/001.json', {
+            'command': 'deploy', 'result': 'success', 'finished_at': '2026-11-20T09:00:00+00:00',
+        })
+        appctl.save(project / 'history/002.json', {
+            'command': 'deploy', 'result': 'noop', 'finished_at': '2026-11-21T08:00:00+00:00',
+        })
+        api = self.container('a' * 64, 'api-custom.service', 'journald')
+        worker = self.container('b' * 64, 'worker.service', 'journald')
+        api['State'] = {'Running': True, 'StartedAt': '2026-11-21T07:50:00Z'}
+        worker['State'] = {'Running': True, 'StartedAt': '2026-11-21T07:55:00Z'}
+        containers = {'api-container': api, 'systemd-worker': worker}
+        observed = datetime(2026, 11, 21, 8, 0, 0, tzinfo=timezone.utc).timestamp()
+        with patch.object(appctl, 'inspect_container', side_effect=containers.get), \
+                patch.object(appctl.time, 'time', return_value=observed):
+            status, _, stdout, stderr = self.logs('api', podman_available=True)
+        self.assertEqual(status, 0)
+        self.assertEqual(stdout, '')
+        self.assertIn('Project demo  |  Deployed (UTC) 2026-11-20 09:00:00  |  Uptime 5m', stderr)
+        self.assertRegex(stderr, r'api\s+2026-11-20 08:00:00\s+10m')
+        self.assertNotIn('worker', stderr)
+        _, _, _, stderr = self.logs('api')
+        self.assertIn('Project demo  |  Deployed (UTC) 2026-11-20 09:00:00  |  Uptime -', stderr)
+
     def test_podman_logs_use_verified_ids_and_native_options_for_mixed_drivers(self):
         ids = ['a' * 64, 'b' * 64]
         containers = {
@@ -403,7 +484,7 @@ class LogsTests(unittest.TestCase):
             'systemd-worker': self.container(ids[1], 'worker.service', 'journald'),
         }
         with patch.object(appctl, 'inspect_container', side_effect=containers.get):
-            status, child = self.logs('-f', '-n', '0', '--since', '30m', source='podman')
+            status, child, *_ = self.logs('-f', '-n', '0', '--since', '30m', source='podman')
         self.assertEqual(status, 0)
         self.assertEqual(child.args, ([
             'podman', 'logs', '--names', '--timestamps', '--tail=0', '--follow', '--since=30m', '--', *ids,
@@ -414,11 +495,11 @@ class LogsTests(unittest.TestCase):
             'api-container': self.container('a' * 64, 'api-custom.service', 'k8s-file'),
             'systemd-worker': self.container('b' * 64, 'worker.service', 'none'),
         }
-        with patch.object(appctl, 'inspect_container', side_effect=containers.get), redirect_stderr(StringIO()) as stderr:
-            status, child = self.logs(source='podman')
+        with patch.object(appctl, 'inspect_container', side_effect=containers.get):
+            status, child, _, stderr = self.logs(source='podman')
         self.assertEqual(status, 0)
         self.assertEqual(child.args[0][-2:], ['--', 'a' * 64])
-        self.assertIn('Skipping worker: the none log driver stores no output', stderr.getvalue())
+        self.assertIn('Skipping worker: the none log driver stores no output', stderr)
 
     def test_podman_logs_require_a_container_owned_by_the_selected_service(self):
         with patch.object(appctl, 'inspect_container', return_value=None):
@@ -434,6 +515,54 @@ class LogsTests(unittest.TestCase):
             appctl.parse_args(['logs', 'demo', '--lines', '-1'])
         self.assertEqual(error.exception.code, 2)
         self.assertIn('--lines must be non-negative', stderr.getvalue())
+
+    def stats(self, containers, *args, child_status=0):
+        with patch.object(appctl, 'ROOT', self.root), patch.object(appctl, 'OUT', appctl.Output()), \
+                patch.object(appctl, 'configure'), patch.object(appctl.shutil, 'which', return_value='/test/podman') as which, \
+                patch.object(appctl, 'inspect_container', side_effect=containers.get), \
+                patch.object(appctl.subprocess, 'run', return_value=SimpleNamespace(returncode=child_status)) as child, \
+                redirect_stdout(StringIO()) as stdout, redirect_stderr(StringIO()) as stderr:
+            status = appctl.main(['stats', 'demo', *args, '--no-color'])
+        which.assert_called_once_with('podman')
+        self.assertFalse((self.root / 'deploy.lock').exists())
+        self.assertFalse((self.root / 'demo/history').exists())
+        return status, [call.args[0] for call in child.call_args_list], stdout.getvalue(), stderr.getvalue()
+
+    def running_containers(self):
+        api = self.container('a' * 64, 'api-custom.service', 'journald')
+        worker = self.container('b' * 64, 'worker.service', 'journald')
+        for container in (api, worker):
+            container['State'] = {'Running': True, 'Status': 'running'}
+        return {'api-container': api, 'systemd-worker': worker}
+
+    def test_project_stats_snapshot_targets_only_the_projects_running_containers(self):
+        status, commands, _, _ = self.stats(self.running_containers(), '--no-stream')
+        self.assertEqual(status, 0)
+        self.assertEqual(commands, [['podman', 'stats', '--no-stream', '--no-reset', '--', 'a' * 64, 'b' * 64]])
+
+    def test_single_service_stream_respects_interval_and_interrupt(self):
+        status, commands, _, _ = self.stats(self.running_containers(), 'api', '-i', '2',
+                                             child_status=-signal.SIGINT)
+        self.assertEqual(status, 130)
+        self.assertEqual(commands, [['podman', 'stats', '--no-reset', '--interval=2', '--', 'a' * 64]])
+
+    def test_process_snapshots_show_states_and_group_rows_by_service(self):
+        status, commands, report, _ = self.stats(self.running_containers(), '--processes')
+        details = ['user', 'pid', 'ppid', 'state', 'pcpu', 'etime', 'args']
+        self.assertEqual(status, 0)
+        self.assertEqual(commands, [['podman', 'top', '--', container_id, *details]
+                                    for container_id in ('a' * 64, 'b' * 64)])
+        self.assertEqual(report.split(), ['api', 'worker'])
+
+    def test_stats_reports_stopped_services_and_fails_when_none_remain(self):
+        containers = self.running_containers()
+        containers['api-container']['State'] = {'Running': False, 'Status': 'exited'}
+        status, commands, _, warnings = self.stats(containers, '--no-stream')
+        self.assertEqual(status, 0)
+        self.assertEqual(commands, [['podman', 'stats', '--no-stream', '--no-reset', '--', 'b' * 64]])
+        self.assertIn('Skipping api: container is exited', warnings)
+        with self.assertRaisesRegex(appctl.DeployError, 'No running containers in demo'):
+            self.stats(containers, 'api')
 
 
 if __name__ == '__main__':
