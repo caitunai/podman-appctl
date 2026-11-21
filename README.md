@@ -34,10 +34,10 @@ flowchart TD
     D --> E[Resolve images and compare deployment state]
     E --> F{Changes required?}
     F -->|No| G[Keep existing services running]
-    F -->|Yes| H[Install changed Quadlets and clean up removed services]
-    H --> I[Reload systemd if needed]
-    I --> J[Start or restart affected services]
-    J --> K[Verify runtime state and save deployment state]
+    F -->|Yes| H[Preflight and install changed Quadlets]
+    H --> I[Reload systemd and verify loaded units]
+    I --> J[Stop removed services and update affected services in dependency order]
+    J --> K[Verify all desired services, clean up old definitions, and save state]
     K --> L[Systemd manages rootless Podman containers]
 ```
 
@@ -57,6 +57,8 @@ Compose is used as a **configuration format**, not as the runtime orchestrator. 
 The defaults are designed for the reference environment but can be overridden without modifying the script. Changing the Podlet compatibility target does not install or upgrade Podman, and does not guarantee compatibility with every Podman version. This is not a general-purpose Compose compatibility layer.
 
 ## Installation
+
+**appctl has zero PyPI dependencies.** The single `appctl.py` script uses only the Python 3.9+ standard library. Run it directly with Python. Podman, Podlet, and systemd are separate Linux system requirements.
 
 ### 1. Prepare rootless Podman
 
@@ -303,13 +305,15 @@ A service's deployment fingerprint includes:
 
 - The generated Quadlet file content and resolved local image ID.
 - SHA-256 hashes of regular files mounted using supported `Volume=` or bind `Mount=` definitions, and files referenced by `EnvironmentFile=`.
-- Supported local Quadlet and systemd drop-in configuration files.
+- Supported local Quadlet and systemd drop-in configuration files, including service-name prefixes under `$XDG_CONFIG_HOME/systemd/user` (default: `~/.config/systemd/user`).
 
 Configuration file names are not restricted to `.app.toml` or `.env`. Files such as `.appprod.toml`, `settings.json`, and `config.yaml` are tracked when explicitly referenced. Missing required bind sources cause deployment to fail during preflight. Directory contents are deliberately not hashed recursively, so uploaded files, model files, and other persistent data do not trigger deployments.
 
 Configuration changes are detected **when `appctl deploy` runs**; appctl is not a file watcher. For unchanged definitions, no `daemon-reload` is required merely because a mounted configuration file or image ID changed.
 
 Use `pull_policy: never` explicitly in each Compose service. appctl resolves images before starting services and prevents implicit registry pulls during systemd startup. Prefer versioned image references; if a mutable tag has been updated, use `--pull` to refresh it.
+
+When definitions change, appctl checks the candidate Quadlets with the Podman generator in a temporary directory. It verifies that systemd loads the expected units before stopping removed services. Updates follow the loaded systemd dependency order, and deployment success requires all desired services to be active with the expected images.
 
 ### Lifecycle semantics
 
@@ -321,7 +325,9 @@ Stopping a service is temporary. systemd will not immediately restart a service 
 
 Generated Quadlets are installed in the deployment user's `$XDG_CONFIG_HOME/containers/systemd` (default: `~/.config/containers/systemd`). The project manifest records resource ownership and appctl checks for conflicts before mutating managed resources. Use unique service, container, volume, and network names across projects sharing a deployment account; Compose project names alone do not guarantee isolation in a shared Quadlet directory.
 
-If a service is removed from Compose, appctl stops its owned systemd unit, removes its generated `.container` file, and prunes its active deployment state. Networks, named volumes, their reserved definitions, local images, and host data remain. Changed network or volume definitions require manual migration. At least one container service must remain in Compose; empty projects and complete project teardown are not currently supported.
+If a service is removed from Compose, appctl stops its owned systemd unit. It removes the old `.container` file after the desired services pass runtime verification and prunes its deployment state. A replacement can take over the old service's port after the old service stops. Networks, named volumes, their reserved definitions, local images, and host data remain. Changed network or volume definitions require manual migration. Keep at least one container service in Compose.
+
+The manifest also reserves named volumes referenced directly by containers, including volumes for which Podlet emits no `.volume` file. Services in the same project can share a named volume. Each named volume is reserved to one project per deployment account.
 
 By design, appctl rejects unmanaged Quadlets or runtime objects with conflicting names and does not automatically adopt pre-existing services. Do not use another deployment tool concurrently against appctl-managed resources or directly edit generated definitions.
 
@@ -382,7 +388,7 @@ systemctl --user cat myapp-api.service
 
 appctl focuses on ordinary long-running, image-based services in a single rootless Podman environment. It currently does not provide:
 
-- HTTP or application-level readiness checks, automatic rollback, or blue/green deployments. Deployment verification checks systemd and the expected running container image, not business readiness.
+- HTTP or application-level readiness checks, automatic rollback of running services, or blue/green deployments. appctl restores changed Quadlet files if live unit validation fails. Deployment verification checks systemd and the expected running container image.
 - Multi-host scheduling, high availability, load balancing, or image building.
 - Arbitrary Compose/Quadlet features, including pods, build/image units, oneshot/template units, custom aliases, dynamic resource specifiers, or raw `PodmanArgs`/`GlobalArgs`.
 - Recursive configuration-directory hashing, secret-value change tracking, comprehensive host-port conflict auditing, or full detection of external runtime changes.
@@ -391,6 +397,8 @@ appctl focuses on ordinary long-running, image-based services in a single rootle
 Use static, unique resource names, explicit bind paths and `pull_policy: never`. Keep identity, mount, and lifecycle settings in Compose instead of overriding them in local drop-ins. Validate changes on a non-production host before deploying. This is a trusted-operator tool, not a multi-tenant security boundary.
 
 ## Contributing
+
+Run the regression suite with `python3 -m unittest discover -s tests`.
 
 Bug reports, documentation improvements, reproducible compatibility reports, and pull requests are welcome. When reporting deployment issues, include the appctl, Podman, Podlet, and OS versions, a sanitized Compose example, and relevant `--verbose` output. Never include registry credentials, environment secrets, or private configuration contents.
 

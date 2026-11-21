@@ -52,8 +52,8 @@
 #     No secrets or config values intentionally stored in operation history.
 #   * Preserves named volumes, networks, bind data and images. Removed resource
 #     definitions stay reserved; changed network/volume definitions require manual migration.
-#   * No HTTP health check, automatic rollback, or blue/green. Success means systemd
-#     active and expected container running; not business readiness.
+#   * Quadlet generator preflight and recovery of definitions after failed live
+#     validation. No application-level health check or runtime rollback.
 #   * Scope: ordinary long-running, image-based services, static literal names,
 #     explicit absolute bind paths (Podlet resolves relative host paths), normal
 #     Volume/EnvironmentFile and Mount=type=bind. No pods/builds/oneshot/template
@@ -80,6 +80,7 @@ import shlex
 import shutil
 from collections import Counter
 import subprocess
+from graphlib import CycleError, TopologicalSorter
 import sys
 import tempfile
 import time
@@ -92,7 +93,8 @@ DEFAULT_PODMAN_VERSION = '5.4'
 DEPLOY_USER = DEFAULT_USER
 BASE = Path(DEFAULT_BASE_DIR)
 HOME = Path.home()
-QUAD = Path(os.environ.get('XDG_CONFIG_HOME', HOME / '.config')) / 'containers/systemd'
+CONFIG = Path(os.environ.get('XDG_CONFIG_HOME') or HOME / '.config')
+QUAD = CONFIG / 'containers/systemd'
 ROOT = Path(os.environ.get('XDG_STATE_HOME', HOME / '.local/state')) / 'appctl'
 DAYS = 90
 MAX_HISTORY = 100
@@ -101,6 +103,7 @@ NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]*\Z')
 TYPES = {'.container': ('Container', 'ContainerName', ''),
          '.network': ('Network', 'NetworkName', '-network'),
          '.volume': ('Volume', 'VolumeName', '-volume')}
+ADMIN_QUAD = Path('/etc/containers/systemd/users')
 
 class DeployError(Exception): pass
 
@@ -160,7 +163,7 @@ class Output:
         title = {'success':'SUCCESS','noop':'NO CHANGES','failed':'FAILED'}[result]
         print(self.style(title, '1;31' if result=='failed' else '1;32') + f'  |  {seconds:.2f}s' + (f'  |  {stats}' if stats else ''), flush=True)
         if result == 'failed':
-            self.line('WARN','Deployment/operation may be partially applied; no automatic rollback.')
+            self.line('WARN','Deployment/operation may be partially applied. Check the operation history.')
 
 OUT = Output()
 
@@ -189,12 +192,12 @@ def configure():
 
 def now(): return dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds')
 
-def run(*args, ok=(0,), capture=True):
+def run(*args, ok=(0,), capture=True, env=None):
     # Capture noisy tools even in normal mode; show success warnings and full
     # failure diagnostics. Query exit codes (e.g. not-found) are expected.
     if OUT.verbose: OUT.line('INFO', '$ ' + shlex.join(args))
     p = subprocess.run(args, text=True, errors='replace', stdout=subprocess.PIPE,
-                       stderr=subprocess.PIPE)
+                       stderr=subprocess.PIPE, env=env)
     if p.returncode not in ok:
         raise CommandError(args, p.returncode, p.stdout, p.stderr)
     if OUT.verbose and not capture and p.stdout: OUT.diagnostic(p.stdout, sys.stdout)
@@ -233,16 +236,13 @@ def exists(kind, name):
     return run('podman', kind, 'exists', name, ok=(0,1)).returncode == 0
 
 def unit_info(unit):
-    p = system('show', '--property=LoadState,SourcePath,FragmentPath,NeedDaemonReload,ActiveState,SubState',
-               unit, ok=(0,1,4))
+    p = system('show', '--property=LoadState,SourcePath,NeedDaemonReload,ActiveState,SubState,'
+               'InvocationID,Job,After,Requires,Requisite,BindsTo,PartOf', unit, ok=(0,1,4))
     info = dict(line.split('=',1) for line in p.stdout.splitlines() if '=' in line)
     if not info.get('LoadState'): fail(f'Cannot inspect systemd unit {unit}')
     return info
 
 def same_path(a, b): return bool(a) and Path(a).resolve() == Path(b).resolve()
-
-def active(unit):
-    return system('is-active', '--quiet', unit, ok=(0,3,4)).returncode == 0
 
 def inspect_container(name):
     if not exists('container', name): return None
@@ -262,16 +262,25 @@ def assert_runtime(meta, allowed):
     return None
 
 def parse(path):
-    sections = {}; group = None
+    sections = {}
+    group = None
+    continued = []
     for line in path.read_text().splitlines():
         line = line.strip()
         if not line or line.startswith(('#',';')): continue
+        if line.endswith('\\'):
+            continued.append(line[:-1])
+            continue
+        if continued:
+            line = ' '.join([*continued, line])
+            continued.clear()
         if line.startswith('[') and line.endswith(']'):
             group = line[1:-1]; sections.setdefault(group, {}); continue
-        if group is None or '=' not in line or line.endswith('\\'):
+        if group is None or '=' not in line:
             fail(f'Unsupported Quadlet syntax in {path.name}')
         k,v = line.split('=',1)
         sections[group].setdefault(k.strip(), []).append(v.strip())
+    if continued: fail(f'Unterminated continuation in {path.name}')
     return sections
 
 def one(section, key, default=''):
@@ -306,21 +315,46 @@ def metadata(path):
         fail('NetworkDeleteOnStop is unsupported')
     return {'kind':group.lower(),'unit':unitbase+'.service','resource':resource}
 
+def dropin_dirs(root, filename):
+    stem, suffix = os.path.splitext(filename)
+    return [root / (suffix[1:] + '.d'), root / (filename + '.d'),
+            *(root / (stem[:i + 1] + suffix + '.d') for i, c in enumerate(stem) if c == '-')]
+
+
 def dropins(path):
     # Local global, prefix and exact Quadlet drop-ins. Fingerprints also include
     # local systemd service drop-ins. External admin drop-ins require --force.
-    stem = path.stem; suffix = path.suffix
-    dirs = [QUAD/(suffix[1:]+'.d'), QUAD/(path.name+'.d')]
-    for i,c in enumerate(stem):
-        if c == '-': dirs.append(QUAD/(stem[:i+1]+suffix+'.d'))
-    service_dir = HOME/'.config/systemd/user'
-    dirs += [service_dir/'service.d', service_dir/(metadata(path)['unit']+'.d')]
+    dirs = dropin_dirs(QUAD, path.name)
+    dirs += dropin_dirs(CONFIG / 'systemd/user', metadata(path)['unit'])
     paths = sorted({p for d in dirs for p in d.glob('*.conf')})
     for p in paths:
         section = parse(p)
         if any(k in section.get('Container', {}) for k in ('ContainerName','ServiceName','Image','Pull','Volume','Mount','EnvironmentFile','PodmanArgs','GlobalArgs','Pod')) or 'Network' in section or 'Volume' in section or any(k in section.get('Service',{}) for k in ('ExecStart','ExecStop','ExecStopPost','ExecStartPre')) or 'Alias' in section.get('Install',{}):
             fail(f'Identity, mount or lifecycle override in drop-in: {p}; move it into Compose')
     return paths
+
+
+def mount_options(value):
+    return dict(token.split('=', 1) for token in next(csv.reader([value])) if '=' in token)
+
+
+def volume_mounts(fields):
+    for value in fields.get('Volume', []):
+        source, separator, _ = value.strip('"').partition(':')
+        if separator and source:
+            yield source
+    for value in fields.get('Mount', []):
+        options = mount_options(value)
+        if options.get('type') == 'volume':
+            source = options.get('source') or options.get('src')
+            if source:
+                yield source
+
+
+def named_volumes(fields):
+    return {source for source in volume_mounts(fields)
+            if not source.startswith(('/', '.', '~', '%')) and not source.endswith('.volume')}
+
 
 def file_inputs(path):
     fields = parse(path)['Container']; result = {}
@@ -332,14 +366,14 @@ def file_inputs(path):
         elif optional and not p.exists(): result[s] = 'missing-optional'
         else: fail(f'Missing/invalid config or bind source: {s}')
     for v in fields.get('Volume', []):
-        v = v.strip('"')
-        source = v.split(':',1)[0]
-        if source.startswith('/'): track(source)
-        elif source.startswith(('.', '~', '%')): fail(f'Unresolved bind path in {path.name}')
+        source, separator, _ = v.strip('"').partition(':')
+        if separator:
+            if source.startswith('/'): track(source)
+            elif source.startswith(('.', '~', '%')): fail(f'Unresolved bind path in {path.name}')
     for v in fields.get('EnvironmentFile', []):
         for s in shlex.split(v): track(s.lstrip('-'), s.startswith('-'), False)
     for v in fields.get('Mount', []):
-        tokens = next(csv.reader([v])); opts = dict(t.split('=',1) for t in tokens if '=' in t)
+        opts = mount_options(v)
         if opts.get('type') == 'bind':
             source = opts.get('source') or opts.get('src')
             if not source: fail(f'Missing Mount source in {path.name}')
@@ -381,14 +415,46 @@ def gc():
                 if p.is_file() and p.stat().st_mtime < cutoff: p.unlink(); count += 1
     return count
 
-def check_collisions(app, desired, owned):
-    keys = {}
+def load_manifest(path):
+    manifest = load(path, {'files': {}, 'named_volumes': [], 'reload_pending': False})
+    if (not isinstance(manifest, dict) or not isinstance(manifest.get('files'), dict)
+            or not isinstance(manifest.get('named_volumes'), list)):
+        fail(f'Invalid ownership manifest: {path}')
+    return manifest
+
+
+def volume_names(files):
+    return {meta['resource'] for meta in files.values() if meta['kind'] == 'volume'}
+
+
+def project_manifests(app):
     for project in ROOT.iterdir():
-        if not project.is_dir() or project.name == app: continue
-        other = load(project/'manifest.json', {}).get('files', {})
-        for f,m in other.items():
+        path = project / 'manifest.json'
+        if project.name != app and path.is_file():
+            yield project.name, load_manifest(path)
+
+
+def runtime_quadlet_dir():
+    runtime = os.environ.get('XDG_RUNTIME_DIR')
+    return Path(runtime) / 'containers/systemd' if runtime else None
+
+
+def shared_admin_entries():
+    if ADMIN_QUAD.is_dir():
+        yield from (path for path in ADMIN_QUAD.iterdir() if not path.name.isdecimal())
+
+
+def check_collisions(app, desired, manifest, requested_volumes):
+    owned = manifest['files']
+    prior_claims = set(manifest['named_volumes'])
+    keys = {}
+    for project, other_manifest in project_manifests(app):
+        for f,m in other_manifest['files'].items():
             for k in [('file',f),('unit',m['unit']),(m['kind'],m['resource'])]:
-                keys[k] = project.name
+                keys[k] = project
+        for name in other_manifest['named_volumes']:
+            keys['volume', name] = project
+    claims = prior_claims | requested_volumes
     seen = set()
     for f,m in desired.items():
         for k in [('file',f),('unit',m['unit']),(m['kind'],m['resource'])]:
@@ -401,31 +467,36 @@ def check_collisions(app, desired, owned):
                 if old != m: fail(f'Identity changed for {f}; manual migration required')
             elif old['unit']==m['unit'] or (old['kind'],old['resource'])==(m['kind'],m['resource']):
                 fail(f'Name {f} conflicts with reserved {oldf}; remove it first')
+    owned_volumes = volume_names(owned)
+    desired_volumes = volume_names(desired)
+    reserved_volumes = prior_claims | owned_volumes | desired_volumes
+    for name in sorted(claims):
+        key = ('volume', literal(name, 'named volume'))
+        if key in keys: fail(f'Named volume {name} is owned by project {keys[key]}')
+        seen.add(key)
+        if name not in reserved_volumes and exists('volume', name):
+            fail(f'Existing unmanaged volume: {name}')
     # Include all existing local Quadlets, even if not managed by appctl.
-    roots = [QUAD, Path('/etc/containers/systemd/users') / str(os.getuid()),
-             Path('/etc/containers/systemd/users')]
-    if os.environ.get('XDG_RUNTIME_DIR'):
-        roots.append(Path(os.environ['XDG_RUNTIME_DIR'])/'containers/systemd')
-    # Admin-wide directory: do not descend into other users' numeric subdirectories.
-    paths = set(QUAD.rglob('*'))
-    for root in roots[1:]:
-        if root == Path('/etc/containers/systemd/users'):
-            paths.update(root.glob('*'))
-        else: paths.update(root.rglob('*'))
+    roots = [QUAD, ADMIN_QUAD / str(os.getuid()), runtime_quadlet_dir()]
+    paths = {p for root in roots if root is not None for p in root.rglob('*')}
+    for entry in shared_admin_entries():
+        paths.add(entry)
+        if entry.is_dir(): paths.update(entry.rglob('*'))
     for p in paths:
         if not p.is_file() or p.suffix not in TYPES: continue
         if p.parent == QUAD and p.name in desired: continue
         if p.parent == QUAD and p.name in owned: continue
-        # Only inspect literal identities; unrelated advanced units remain outside scope.
-        try: m = metadata(p)
-        except DeployError:
-            group,key,suffix = TYPES[p.suffix]
-            fields = parse(p).get(group,{})
-            ub = one(fields,'ServiceName',p.stem+suffix)
-            m = {'unit':ub+'.service','kind':group.lower(),
-                 'resource':one(fields,key,'systemd-'+(ub if group=='Container' else p.stem))}
-        if ('unit',m['unit']) in seen or (m['kind'],m['resource']) in seen:
+        # Read effective identities without applying appctl's managed-unit restrictions.
+        group, key, suffix = TYPES[p.suffix]
+        fields = parse(p).get(group, {})
+        unit = fields.get('ServiceName', [p.stem + suffix])[-1]
+        default = 'systemd-' + (unit if group == 'Container' else p.stem)
+        resource = fields.get(key, [default])[-1]
+        if ('unit', unit + '.service') in seen or (group.lower(), resource) in seen:
             fail(f'Existing Quadlet name conflict: {p}')
+        # A stopped unmanaged container may reference a volume that does not exist yet.
+        if group == 'Container' and named_volumes(fields) & (claims | desired_volumes):
+            fail(f'Named volume conflict with existing Quadlet: {p}')
 
     for f,m in {**owned,**desired}.items():
         dest=QUAD/f; info=unit_info(m['unit'])
@@ -441,12 +512,178 @@ def check_collisions(app, desired, owned):
         elif not allowed and source_ok and info['LoadState']!='not-found':
             fail(f'Unmanaged generated unit: {m["unit"]}')
         assert_runtime(m, allowed)
+    return claims
+
+
+def generator_command():
+    for parent in (Path('/usr/lib/systemd'), Path('/usr/local/lib/systemd'), Path('/lib/systemd')):
+        for relative in ('user-generators/podman-user-generator', 'system-generators/podman-system-generator'):
+            path = parent / relative
+            if path.is_file() and os.access(path, os.X_OK):
+                return str(path)
+    for name in ('podman-user-generator', 'podman-system-generator', 'quadlet'):
+        path = shutil.which(name)
+        if path:
+            return path
+    fail('Podman Quadlet generator not found. Install Podman with systemd integration.')
+
+
+def preflight_generator(desired, desired_paths, stale):
+    with tempfile.TemporaryDirectory(prefix='appctl-quadlet-') as tmp:
+        temp = Path(tmp)
+        staged = temp / 'quadlets'
+        staged.mkdir()
+        for entry in QUAD.iterdir():
+            if entry.name not in desired and entry.name not in stale:
+                (staged / entry.name).symlink_to(entry.absolute())
+        for filename, path in desired_paths.items():
+            shutil.copyfile(path, staged / filename)
+        shared = temp / 'admin'
+        shared.mkdir()
+        for entry in shared_admin_entries():
+            (shared / entry.name).symlink_to(entry)
+        roots = (runtime_quadlet_dir(), staged, shared, ADMIN_QUAD / str(os.getuid()))
+        env = dict(os.environ, QUADLET_UNIT_DIRS=os.pathsep.join(str(p) for p in roots if p is not None))
+        cmd = (generator_command(), '--user', '--dryrun')
+        result = run(*cmd, env=env, ok=(0, 1))
+        # The generator can report an error in another project's file and still
+        # emit all of ours. Verify each requested output and its source.
+        sources = {}
+        unit = None
+        for line in result.stdout.splitlines():
+            if line.startswith('---') and line.endswith('.service---'):
+                unit = Path(line[3:-3]).name
+            elif unit is not None and line.startswith('SourcePath='):
+                sources[unit] = line.partition('=')[2]
+        for filename, meta in desired.items():
+            if not same_path(sources.get(meta['unit']), staged / filename):
+                if result.returncode:
+                    raise CommandError(cmd, result.returncode, '', result.stderr)
+                fail(f'Quadlet preflight could not generate {meta["unit"]} from {filename}')
+
+
+def loaded_units(desired):
+    units = {}
+    for filename, meta in desired.items():
+        unit = meta['unit']
+        info = unit_info(unit)
+        if info['LoadState'] != 'loaded' or not same_path(info.get('SourcePath'), QUAD / filename):
+            fail(f'Quadlet generation failed or shadowed: {unit}')
+        units[unit] = info
+    return units
+
+
+def reload_units():
+    OUT.line('INFO', 'Reloading systemd user manager')
+    system('daemon-reload', capture=False)
+
+
+def install_quadlets(desired, desired_paths, changed, stale, reload_needed, event):
+    previous = {}
+    try:
+        for filename in changed:
+            path = QUAD / filename
+            previous[path] = path.read_bytes() if path.is_file() else None
+            atomic(path, desired_paths[filename].read_bytes())
+            event('installed', file=filename)
+        if reload_needed: reload_units()
+        else: OUT.line('SKIP', 'systemd daemon-reload not required')
+        units = loaded_units(desired)
+        container_units = {meta['unit']: units[meta['unit']] for meta in desired.values()
+                           if meta['kind'] == 'container'}
+        stale_units = {meta['unit'] for meta in stale.values()}
+        for unit, info in container_units.items():
+            required = {dep for key in ('Requires', 'Requisite', 'BindsTo') for dep in info.get(key, '').split()}
+            removed = required & stale_units
+            if removed:
+                fail(f'{unit} requires removed unit(s): ' + ', '.join(sorted(removed)))
+        return container_units, list(service_order(container_units))
+    except (Exception, KeyboardInterrupt):
+        if previous:
+            try:
+                for path, data in previous.items():
+                    if data is None: path.unlink(missing_ok=True)
+                    else: atomic(path, data)
+                reload_units()
+                OUT.line('INFO', 'Restored previous Quadlet definitions')
+            except (DeployError, OSError) as error:
+                OUT.line('WARN', f'Could not restore previous Quadlet definitions: {error}')
+        raise
+
+
+def service_order(units):
+    graph = TopologicalSorter({unit: set(info.get('After', '').split()) & units.keys()
+                               for unit, info in units.items()})
+    try:
+        graph.prepare()
+    except CycleError as error:
+        fail('Circular systemd ordering: ' + ' -> '.join(error.args[1]))
+    # Prefer required services first when systemd leaves their order open.
+    predecessors = {unit: {dep for key in ('Requires', 'Requisite', 'BindsTo', 'PartOf')
+                           for dep in info.get(key, '').split()} & units.keys()
+                    for unit, info in units.items()}
+    pending = set(units)
+    ready = set(graph.get_ready())
+    while ready:
+        candidates = sorted(ready)
+        unit = next((name for name in candidates if not predecessors[name] & pending), candidates[0])
+        yield unit
+        pending.remove(unit)
+        ready.remove(unit)
+        graph.done(unit)
+        ready.update(graph.get_ready())
+
+
+def running_image(container, image_id):
+    return bool(container and container.get('State', {}).get('Running') and
+                container.get('Image', '').removeprefix('sha256:') == image_id.removeprefix('sha256:'))
+
+
+def verify_services(containers, plans):
+    units = loaded_units(containers)
+    for filename, meta in containers.items():
+        unit = meta['unit']
+        if units[unit].get('ActiveState') != 'active':
+            fail(f'Service not active: {unit}')
+        if units[unit].get('Job') not in (None, '', '0'):
+            fail(f'Service still has a pending systemd job: {unit}')
+        if not running_image(assert_runtime(meta, True), plans[filename]['image_id']):
+            fail(f'Container not running expected image: {meta["resource"]}')
+
+
+def apply_services(containers, units, order, plans, updates, state, state_path, event):
+    filenames = {meta['unit']: filename for filename, meta in containers.items()}
+    actions = {}
+    for unit in order:
+        filename = filenames[unit]
+        meta, plan = containers[filename], plans[filename]
+        info = unit_info(unit)
+        if info.get('Job') not in (None, '', '0'):
+            # Join a queued start/restart from an earlier dependency operation.
+            system('start', unit, capture=False)
+            info = unit_info(unit)
+        running = info.get('ActiveState') == 'active' and running_image(assert_runtime(meta, True), plan['image_id'])
+        if filename not in updates and running:
+            continue
+        action = 'restart' if units[unit].get('ActiveState') == 'active' else 'start'
+        actions[filename] = action
+        invocation = info.get('InvocationID', '').strip('0')
+        if running and invocation and info['InvocationID'] != units[unit].get('InvocationID'):
+            continue
+        if filename not in updates:
+            state.pop(filename, None)
+            save(state_path, state)
+        event(action + '_begin', unit=unit, image=plan['image'], image_id=plan['image_id'])
+        system('restart' if info.get('ActiveState') == 'active' else 'start', unit, capture=False)
+    return actions
+
 
 def deploy(args, project, event):
     app=args.app; appdir=BASE/app; compose=appdir/'compose.yml'
     if not compose.is_file(): fail(f'Compose not found: {compose}')
     mp=project/'manifest.json'; sp=project/'state.json'
-    manifest=load(mp,{'files':{},'reload_pending':False}); owned=manifest['files']
+    manifest = load_manifest(mp)
+    owned = manifest['files']
     state=load(sp,{})
     OUT.phase('[1/4] Generate & validate Quadlet')
     # Preflight all generated files and config sources before changing services.
@@ -460,7 +697,9 @@ def deploy(args, project, event):
         desired={f:metadata(p) for f,p in desired_paths.items()}
         containers={f:m for f,m in desired.items() if m['kind']=='container'}
         if not containers: fail('No container units generated; empty project not supported')
-        check_collisions(app,desired,owned)
+        requested_volumes = {name for f in containers
+                             for name in named_volumes(parse(desired_paths[f])['Container'])}
+        claims = check_collisions(app, desired, manifest, requested_volumes)
         # Retain resource definitions and ownership even if removed from Compose.
         for f,m in desired.items():
             dest=QUAD/f
@@ -483,8 +722,7 @@ def deploy(args, project, event):
                 if not images[image]: fail('Empty image ID')
             image_id=images[image]; inputs=fingerprint_inputs(p,image_id); fp=hash_inputs(inputs)
             obj=inspect_container(m['resource']); info=unit_info(m['unit'])
-            running=bool(obj and obj.get('State',{}).get('Running') and
-                         obj.get('Image','').removeprefix('sha256:')==image_id.removeprefix('sha256:'))
+            running = info.get('ActiveState') == 'active' and running_image(obj, image_id)
             prev=state.get(f,{})
             same= (QUAD/f).is_file() and (QUAD/f).read_bytes()==p.read_bytes()
             reasons=[]
@@ -505,7 +743,7 @@ def deploy(args, project, event):
                         if key=='dropins': reload_needed=True
                 if not reasons: reasons.append('deployment fingerprint changed')
             if prev and not same and 'Quadlet changed' not in reasons: reasons.append('Quadlet differs')
-            if (prev or same) and (not running or not active(m['unit'])): reasons.append('not running expected image')
+            if (prev or same) and not running: reasons.append('not running expected image')
             if info.get('NeedDaemonReload')=='yes':
                 reasons.append('systemd reload pending'); reload_needed=True
             update=bool(reasons)
@@ -515,74 +753,64 @@ def deploy(args, project, event):
         stale={f:m for f,m in owned.items() if f not in desired and m['kind']=='container'}
         changed=[f for f,p in desired_paths.items() if not (QUAD/f).is_file() or (QUAD/f).read_bytes()!=p.read_bytes()]
         pending=manifest.get('reload_pending',False)
-        reload_needed=bool(reload_needed or changed or stale or pending)
-        updates=[f for f in plans if plans[f]['update']]
+        reload_needed=bool(reload_needed or changed or pending)
+        updates={f for f in plans if plans[f]['update']}
         for f,m in stale.items(): OUT.line('PLAN',m['unit'],'removed from Compose')
         OUT.line('INFO',f'{len(updates)} to update, {len(plans)-len(updates)} unchanged, {len(stale)} to remove')
-        if not (changed or stale or updates or pending):
+        if not (reload_needed or stale or updates):
             return 'noop'
+        if reload_needed or stale:
+            preflight_generator(desired, desired_paths, stale)
         OUT.phase('[3/4] Apply changes')
         # Reserve names and persist a reload marker BEFORE modifying anything.
-        manifest={'files':{**owned,**desired},'reload_pending':reload_needed}
+        manifest = {'files': {**owned, **desired}, 'named_volumes': sorted(claims),
+                    'reload_pending': bool(reload_needed or stale)}
         save(mp,manifest)
+        container_units, order = install_quadlets(desired, desired_paths, changed, stale, reload_needed, event)
+        # The replacement units are loaded. Old definitions stay available until
+        # the replacement is running, even when it needs to reuse a released port.
         for f in updates: state.pop(f,None)
         save(sp,state)
-        # Stop deleted services before unlinking; never podman rm -f by name.
-        for f,m in stale.items():
+        for m in stale.values():
             event('remove_begin',unit=m['unit'])
             if unit_info(m['unit'])['LoadState']!='not-found': system('stop',m['unit'],capture=False)
             if exists('container',m['resource']): fail(f'Container remains after stop: {m["resource"]}')
-            (QUAD/f).unlink(missing_ok=True)
-            state.pop(f,None); save(sp,state)
-            event('removed',unit=m['unit'])
-        for f in changed:
-            atomic(QUAD/f,desired_paths[f].read_bytes())
-            event('installed',file=f)
-        if reload_needed:
-            OUT.line('INFO','Reloading systemd user manager')
-            system('daemon-reload',capture=False)
-        else: OUT.line('SKIP','systemd daemon-reload not required')
-        # Check generated source paths before restarting anything.
-        for f,m in desired.items():
-            info=unit_info(m['unit'])
-            if info['LoadState']!='loaded' or not same_path(info.get('SourcePath'),QUAD/f):
-                fail(f'Quadlet generation failed or shadowed: {m["unit"]}')
-        # Release removed names only after successful reload and unit removal.
-        for f,m in stale.items():
-            info=unit_info(m['unit'])
-            if info['LoadState']!='not-found': fail(f'Removed unit still loaded: {m["unit"]}')
-            manifest['files'].pop(f,None)
-        manifest['reload_pending']=False; save(mp,manifest)
         OUT.phase('[4/4] Start / restart & verify')
-        if not updates: OUT.line('SKIP','No service restart required')
-        # Start/restart changed services only; no rollback on failure.
-        for f in updates:
+        actions = apply_services(containers, container_units, order, plans, updates, state, sp, event)
+        if not actions: OUT.line('SKIP','No service restart required')
+        verify_services(containers, plans)
+        if stale:
+            for f in stale: (QUAD/f).unlink(missing_ok=True)
+            reload_units()
+            loaded_units(desired)
+            for f, m in stale.items():
+                if unit_info(m['unit'])['LoadState'] != 'not-found':
+                    fail(f'Removed unit still loaded: {m["unit"]}')
+                manifest['files'].pop(f, None)
+                event('removed', unit=m['unit'])
+            verify_services(containers, plans)
+        for f, action in actions.items():
             m=containers[f]; plan=plans[f]
-            action='restart' if active(m['unit']) else 'start'
-            event(action+'_begin',unit=m['unit'],image=plan['image'],image_id=plan['image_id'])
-            system(action,m['unit'],capture=False)
-            if not active(m['unit']): fail(f'Service not active: {m["unit"]}')
-            obj=assert_runtime(m,True)
-            if not obj or not obj.get('State',{}).get('Running') or obj.get('Image','').removeprefix('sha256:')!=plan['image_id'].removeprefix('sha256:'):
-                fail(f'Container not running expected image: {m["resource"]}')
             # Detect config mutation during deployment. No stale fingerprint recorded.
             if fingerprint(desired_paths[f],plan['image_id'])!=plan['fingerprint']:
                 fail(f'Config changed during deployment: {m["unit"]}; retry')
             state[f]={k:v for k,v in plan.items() if k!='update'}
-            state[f]['deployed_at']=now(); save(sp,state)
+            state[f]['deployed_at']=now()
             event('restarted' if action=='restart' else 'started',unit=m['unit'],image=plan['image'],image_id=plan['image_id'])
         # State contains only desired, successfully deployed services.
         state={f:v for f,v in state.items() if f in containers}; save(sp,state)
+        manifest['reload_pending'] = False
+        save(mp, manifest)
         return 'success'
 
 def selected_units(args, project):
     mp = project/'manifest.json'
     if not mp.is_file():
         fail(f'Project not managed: {args.app}; run appctl deploy first')
-    manifest = load(mp, {})
+    manifest = load_manifest(mp)
     if manifest.get('reload_pending') and args.command in ('start','restart'):
         fail('Previous deployment incomplete; run appctl deploy first')
-    files = manifest.get('files', {})
+    files = manifest['files']
     selected = {f:m for f,m in files.items() if m['kind']=='container'}
     if args.service:
         name = args.service + '.container'
@@ -593,12 +821,13 @@ def selected_units(args, project):
     if not selected:
         fail(f'No managed container services in {args.app}')
     # Verify every selected identity before any mutating systemctl call.
-    for other in ROOT.iterdir():
-        if not other.is_dir() or other == project: continue
-        for f,m in load(other/'manifest.json',{}).get('files',{}).items():
+    other_manifests = dict(project_manifests(args.app))
+    for other, other_manifest in other_manifests.items():
+        for f,m in other_manifest['files'].items():
             for sel,sm in selected.items():
                 if f == sel or m['unit'] == sm['unit'] or (m['kind'],m['resource']) == (sm['kind'],sm['resource']):
-                    fail(f'Ownership conflict: {sel} / {other.name}')
+                    fail(f'Ownership conflict: {sel} / {other}')
+    mounts = set()
     for f,m in sorted(selected.items()):
         dest = QUAD/f
         if dest.is_symlink(): fail(f'Refusing symlink: {dest}')
@@ -614,7 +843,17 @@ def selected_units(args, project):
                     fail(f'Unit needs daemon-reload: {m["unit"]}; run appctl deploy first')
                 # Prevent local identity/mount/lifecycle overrides; no file hashing here.
                 dropins(dest)
+                mounts.update(named_volumes(parse(dest)['Container']))
         assert_runtime(m, True)
+    if mounts:
+        unowned = mounts - (set(manifest['named_volumes']) | volume_names(files))
+        if unowned:
+            fail('Unregistered named volume(s); run appctl deploy first: ' + ', '.join(sorted(unowned)))
+        for other, other_manifest in other_manifests.items():
+            other_volumes = set(other_manifest['named_volumes']) | volume_names(other_manifest['files'])
+            conflicts = mounts & other_volumes
+            if conflicts:
+                fail(f'Named volume owned by project {other}: ' + ', '.join(sorted(conflicts)))
     return dict(sorted(selected.items()))
 
 
