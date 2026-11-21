@@ -4,6 +4,7 @@
 # Usage (run as the configured non-root deployment account):
 #   appctl deploy APP [--pull] [--force]
 #   appctl {start,stop,restart,status} APP [SERVICE]
+#   appctl inspect APP [SERVICE]
 #   appctl history APP [--limit N]
 #   appctl gc
 #   appctl --help | --version
@@ -39,6 +40,7 @@
 #   * start/restart use installed unit definitions, not pending Compose changes;
 #     may read current bind files. Last successful deploy fingerprint is retained.
 #     status displays systemd state and actual container state; does not deploy.
+#   * inspect lists ports and mounts from the current Compose file.
 #   * JSON history for deploy/start/stop/restart, including failure and no-op;
 #     read-only status/history calls are not logged. No config values in history.
 #     Retain 90 days AND at most 100 attempts/project (constants below).
@@ -335,13 +337,25 @@ def dropins(path):
 
 
 def mount_options(value):
-    return dict(token.split('=', 1) for token in next(csv.reader([value])) if '=' in token)
+    options = {}
+    for token in next(csv.reader([value])):
+        key, separator, argument = token.partition('=')
+        options[key] = argument if separator else None
+    return options
+
+
+def split_volume(value):
+    source, separator, spec = value.strip('"').partition(':')
+    if not separator:
+        return '', source, ''
+    target, _, options = spec.partition(':')
+    return source, target, options
 
 
 def volume_mounts(fields):
     for value in fields.get('Volume', []):
-        source, separator, _ = value.strip('"').partition(':')
-        if separator and source:
+        source, _, _ = split_volume(value)
+        if source:
             yield source
     for value in fields.get('Mount', []):
         options = mount_options(value)
@@ -366,10 +380,9 @@ def file_inputs(path):
         elif optional and not p.exists(): result[s] = 'missing-optional'
         else: fail(f'Missing/invalid config or bind source: {s}')
     for v in fields.get('Volume', []):
-        source, separator, _ = v.strip('"').partition(':')
-        if separator:
-            if source.startswith('/'): track(source)
-            elif source.startswith(('.', '~', '%')): fail(f'Unresolved bind path in {path.name}')
+        source, _, _ = split_volume(v)
+        if source.startswith('/'): track(source)
+        elif source.startswith(('.', '~', '%')): fail(f'Unresolved bind path in {path.name}')
     for v in fields.get('EnvironmentFile', []):
         for s in shlex.split(v): track(s.lstrip('-'), s.startswith('-'), False)
     for v in fields.get('Mount', []):
@@ -678,9 +691,23 @@ def apply_services(containers, units, order, plans, updates, state, state_path, 
     return actions
 
 
+def compose_path(app):
+    compose = BASE / app / 'compose.yml'
+    if not compose.is_file():
+        fail(f'Compose not found: {compose}')
+    return compose
+
+
+def generate_quadlets(compose, directory):
+    run('podlet', '--podman-version', PODMAN_VERSION, '--file', directory,
+        '--absolute-host-paths', str(compose.parent), '--install', '--wanted-by', 'default.target',
+        '--skip-services-check', 'compose', str(compose), capture=False)
+    return {path.name: path for path in Path(directory).iterdir()}
+
+
 def deploy(args, project, event):
-    app=args.app; appdir=BASE/app; compose=appdir/'compose.yml'
-    if not compose.is_file(): fail(f'Compose not found: {compose}')
+    app = args.app
+    compose = compose_path(app)
     mp=project/'manifest.json'; sp=project/'state.json'
     manifest = load_manifest(mp)
     owned = manifest['files']
@@ -688,10 +715,7 @@ def deploy(args, project, event):
     OUT.phase('[1/4] Generate & validate Quadlet')
     # Preflight all generated files and config sources before changing services.
     with tempfile.TemporaryDirectory(prefix='appctl-') as tmp:
-        run('podlet','--podman-version',PODMAN_VERSION,'--file',tmp,
-            '--absolute-host-paths',str(appdir),'--install','--wanted-by','default.target',
-            '--skip-services-check','compose',str(compose),capture=False)
-        desired_paths={p.name:p for p in Path(tmp).iterdir()}
+        desired_paths = generate_quadlets(compose, tmp)
         if not desired_paths or any(not p.is_file() or p.suffix not in TYPES for p in desired_paths.values()):
             fail('Unexpected Podlet output or no units')
         desired={f:metadata(p) for f,p in desired_paths.items()}
@@ -886,6 +910,88 @@ def show_status(args, project):
     return 0
 
 
+def display_port_mapping(value):
+    parts = value.rsplit(':', 2)
+    if len(parts) == 3:
+        host, published, target = parts
+        # Podlet can print an IPv6 address without the Compose brackets.
+        if ':' in host and not host.startswith('['):
+            return f'[{host}]:{published}:{target}'
+    return value
+
+
+def format_mount_options(options):
+    return ','.join(key if value is None else f'{key}={value}' for key, value in options.items())
+
+
+def container_mounts(fields):
+    for value in fields.get('Volume', []):
+        source, target, options = split_volume(value)
+        kind = 'bind' if source.startswith(('/', '.', '~', '%')) else 'volume'
+        yield kind, source or '(anonymous)', target, options
+    for value in fields.get('Mount', []):
+        options = mount_options(value)
+        kind = options.pop('type', None) or 'mount'
+        source = options.get('source') or options.get('src')
+        target = options.get('target') or options.get('destination') or options.get('dst')
+        coordinates = {'source', 'src', 'target', 'destination', 'dst'}
+        extra = format_mount_options({key: value for key, value in options.items() if key not in coordinates})
+        yield kind, source or ('(anonymous)' if kind == 'volume' else '-'), target, extra
+    for value in fields.get('Tmpfs', []):
+        target, _, options = value.partition(':')
+        yield 'tmpfs', '-', target, options
+    for value in fields.get('Secret', []):
+        name, _, spec = value.partition(',')
+        options = mount_options(spec)
+        if options.pop('type', 'mount') == 'mount':
+            target = options.pop('target', None) or name
+            target = target if target.startswith('/') else f'/run/secrets/{target}'
+            yield 'secret', name, target, format_mount_options(options)
+
+
+def show_compose_resources(args):
+    compose = compose_path(args.app)
+    with tempfile.TemporaryDirectory(prefix='appctl-inspect-') as tmp:
+        generated = generate_quadlets(compose, tmp)
+        services = {path.stem: path for path in generated.values()
+                    if path.suffix == '.container' and path.is_file()}
+        if not services:
+            fail(f'No container services generated from {compose}')
+        if args.service:
+            if args.service not in services:
+                fail(f'Unknown service {args.service} in {args.app}. Available: ' + ', '.join(sorted(services)))
+            services = {args.service: services[args.service]}
+        volumes = {
+            path.name: one(parse(path).get('Volume', {}), 'VolumeName', 'systemd-' + path.stem)
+            for path in generated.values() if path.suffix == '.volume' and path.is_file()
+        }
+        ports = []
+        mounts = []
+        for service, path in sorted(services.items()):
+            fields = parse(path).get('Container')
+            if fields is None:
+                fail(f'Missing [Container] in {path.name}')
+            service_ports = [(service, 'published', display_port_mapping(value))
+                             for value in fields.get('PublishPort', [])]
+            service_ports.extend((service, 'exposed', value) for value in fields.get('ExposeHostPort', []))
+            if 'host' in fields.get('Network', []):
+                service_ports.append((service, 'host network', 'Uses host network'))
+            ports.extend(service_ports or [(service, 'none', '-')])
+            service_mounts = []
+            for kind, source, target, options in container_mounts(fields):
+                if kind == 'volume' and source in volumes:
+                    source = f'{source} ({volumes[source]})'
+                service_mounts.append((service, kind, source, target or '-', options or '-'))
+            mounts.extend(service_mounts or [(service, 'none', '-', '-', '-')])
+
+    OUT.header('inspect', args.app, args.service)
+    OUT.phase('Ports')
+    OUT.table(('SERVICE', 'KIND', 'PORT / MAPPING'), ports)
+    OUT.phase('Mounts')
+    OUT.table(('SERVICE', 'KIND', 'SOURCE', 'CONTAINER PATH', 'OPTIONS'), mounts)
+    return 0
+
+
 def control(args, project, event):
     action = args.command
     selected = selected_units(args, project)
@@ -937,10 +1043,17 @@ def parse_args(argv=None):
     p.add_argument('app',help=f'Project directory under APPCTL_BASE_DIR (default: {DEFAULT_BASE_DIR})')
     p.add_argument('--pull',action='store_true',help='Check registry even for cached images')
     p.add_argument('--force',action='store_true',help='Restart all desired services')
-    for action,helptext in [('start','Start deployed services'),('stop','Temporarily stop deployed services'),('restart','Restart deployed services'),('status','Show systemd and Podman runtime state')]:
+    for action, helptext in [
+        ('start', 'Start deployed services'),
+        ('stop', 'Temporarily stop deployed services'),
+        ('restart', 'Restart deployed services'),
+        ('status', 'Show systemd and Podman runtime state'),
+        ('inspect', 'Show ports and mounts declared in compose.yml'),
+    ]:
         p=subs.add_parser(action,help=helptext)
         p.add_argument('app',help=f'Project directory under APPCTL_BASE_DIR (default: {DEFAULT_BASE_DIR})')
-        p.add_argument('service',nargs='?',help='Compose service name (default: all owned container services)')
+        scope = 'all services in compose.yml' if action == 'inspect' else 'all owned container services'
+        p.add_argument('service', nargs='?', help=f'Compose service name (default: {scope})')
     p=subs.add_parser('history',help='List retained deployment and operation history')
     p.add_argument('app')
     p.add_argument('--limit',type=int,default=20,help='Maximum entries to list (default: 20)')
@@ -961,10 +1074,13 @@ def main(argv=None):
     configure()
     if OUT.verbose:
         OUT.line('INFO', f'User: {DEPLOY_USER} | Base: {BASE} | Podman target: {PODMAN_VERSION}')
-    if args.command not in ('history','gc'):
-        required=['podman','systemctl'] + (['podlet'] if args.command=='deploy' else [])
-        for cmd in required:
-            if not shutil.which(cmd): fail(f'Required command not found: {cmd}')
+    required = ['podman', 'systemctl'] if args.command not in ('history', 'gc', 'inspect') else []
+    if args.command in ('deploy', 'inspect'):
+        required.append('podlet')
+    for cmd in required:
+        if not shutil.which(cmd): fail(f'Required command not found: {cmd}')
+    if args.command == 'inspect':
+        return show_compose_resources(args)
     os.umask(0o077); ROOT.mkdir(parents=True,exist_ok=True)
     os.environ.setdefault('REGISTRY_AUTH_FILE',str(HOME/'.config/containers/auth.json'))
     if args.command not in ('status','history'):

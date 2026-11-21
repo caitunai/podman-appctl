@@ -15,7 +15,8 @@ Designed for self-hosted applications, single-server deployments, and CI/CD work
 - **Compose as the deployment source** — generate `.container`, `.network`, and `.volume` files automatically with Podlet.
 - **Incremental deployment** — compare image IDs, generated Quadlet definitions, referenced configuration files, and supported local drop-ins; restart only affected services.
 - **Local image caching** — reuse existing versioned images; explicitly refresh remote images with `--pull`.
-- **Application lifecycle management** — start, stop, restart, and inspect an entire project or one service.
+- **Application lifecycle management** — start, stop, restart, and check the runtime state of a project or one service.
+- **Compose resource inspection** — list published ports, exposed ports, volumes, and file mounts before deployment.
 - **Ownership-aware cleanup** — remove services deleted from Compose without deleting application data, volumes, networks, or images.
 - **Conflict detection** — check project ownership, unit names, and container/resource names before applying changes.
 - **Deployment and operation history** — record structured JSON events, durations, outcomes, and image information, with automatic retention limits.
@@ -236,6 +237,7 @@ appctl start APP [SERVICE]
 appctl stop APP [SERVICE]
 appctl restart APP [SERVICE]
 appctl status APP [SERVICE]
+appctl inspect APP [SERVICE]
 appctl history APP [--limit N]
 appctl gc
 appctl --help
@@ -251,6 +253,7 @@ appctl --version
 | `stop` | Temporarily stop already-deployed services without deleting deployment definitions or application data. |
 | `restart` | Restart already-deployed services using installed definitions. |
 | `status` | Show systemd state, container state, image reference, and abbreviated image ID. |
+| `inspect` | Show ports and mounts declared in the current Compose file for a project or one service. |
 | `history` | List recent deployment and lifecycle operations (20 entries by default). |
 | `gc` | Clean expired and excess history and old temporary state files across all projects. |
 
@@ -266,6 +269,17 @@ appctl status myapp
 appctl history myapp --limit 50
 appctl gc
 ```
+
+### Inspect Compose ports and mounts
+
+```bash
+appctl inspect myapp              # All services in compose.yml
+appctl inspect myapp myapp-api    # One service
+```
+
+`inspect` uses Podlet to read the current `compose.yml` and works before the first deployment. The port table distinguishes host mappings declared with `ports` from container ports declared with `expose`. It also indicates host networking. The mount table shows the source, container path, and configured options for named volumes, anonymous volumes, bind-mounted files or directories, tmpfs, and mounted secrets.
+
+The report reflects configuration declarations. Host ports assigned automatically by Podman and ports opened by the application at runtime depend on the running container. Use the same project and service names as with `deploy` and `status`.
 
 ### Output options
 

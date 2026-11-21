@@ -142,6 +142,65 @@ class DeployTests(unittest.TestCase):
     def manifest(self, app='demo'):
         return appctl.load(self.state / app / 'manifest.json', {})
 
+    def inspect(self, *selectors):
+        compose = self.apps / 'demo/compose.yml'
+        compose.parent.mkdir(exist_ok=True)
+        compose.touch()
+        unused_state = self.base / 'unused-state'
+        report = StringIO()
+        with patch.object(appctl, 'ROOT', unused_state), patch.object(appctl, 'OUT', appctl.Output()), \
+                patch.object(appctl, 'configure'), patch.object(appctl.shutil, 'which', return_value='/test/podlet') as which, \
+                redirect_stdout(report):
+            self.assertEqual(appctl.main(['inspect', 'demo', *selectors, '--no-color']), 0)
+        which.assert_called_once_with('podlet')
+        self.assertFalse(unused_state.exists())
+        self.assertEqual(self.calls, [])
+        return report.getvalue()
+
+    def test_inspect_reports_declared_ports_and_mounts_for_all_services(self):
+        self.desired = {
+            'api.container': (
+                '[Container]\nImage=docker.io/library/nginx:test\n'
+                'PublishPort=::1:8053:53/udp\n'
+                'PublishPort=[::]:8443:443\n'
+                'PublishPort=127.0.0.1:8000-8002:80-82\n'
+                'PublishPort=443\nExposeHostPort=8080/tcp\n'
+                'Volume=db.volume:/data:rw\nVolume=/scratch\n'
+                'Mount=type=bind,"source=/srv/config,prod.yaml",dst=/etc/api.yaml,ro\n'
+                'Tmpfs=/tmp:rw,size=64m\n'
+                'Secret=cert,target=tls.pem,mode=0440\nSecret=env-only,type=env\n'
+            ),
+            'db.volume': '[Volume]\nVolumeName=app-db\n',
+            'idle.container': quadlet(),
+            'worker.container': quadlet('Network=host\nVolume=/srv/worker:/work:ro,Z\n'),
+        }
+        report = self.inspect()
+        self.assertRegex(report, r'api\s+published\s+\[::1\]:8053:53/udp')
+        self.assertRegex(report, r'api\s+published\s+\[::\]:8443:443')
+        self.assertRegex(report, r'api\s+published\s+127\.0\.0\.1:8000-8002:80-82')
+        self.assertRegex(report, r'api\s+published\s+443')
+        self.assertRegex(report, r'api\s+exposed\s+8080/tcp')
+        self.assertRegex(report, r'api\s+volume\s+db\.volume \(app-db\)\s+/data\s+rw')
+        self.assertRegex(report, r'api\s+volume\s+\(anonymous\)\s+/scratch')
+        self.assertRegex(report, r'api\s+bind\s+/srv/config,prod.yaml\s+/etc/api.yaml\s+ro')
+        self.assertRegex(report, r'api\s+tmpfs\s+-\s+/tmp\s+rw,size=64m')
+        self.assertRegex(report, r'api\s+secret\s+cert\s+/run/secrets/tls.pem\s+mode=0440')
+        self.assertNotIn('env-only', report)
+        self.assertRegex(report, r'worker\s+host network\s+Uses host network')
+        self.assertRegex(report, r'worker\s+bind\s+/srv/worker\s+/work\s+ro,Z')
+        self.assertRegex(report, r'idle\s+none')
+
+    def test_inspect_selects_one_service_and_lists_available_names_on_error(self):
+        self.desired = {
+            'api.container': quadlet('PublishPort=8080:80\n'),
+            'worker.container': quadlet('Volume=jobs:/jobs\n'),
+        }
+        report = self.inspect('worker')
+        self.assertRegex(report, r'worker\s+volume\s+jobs\s+/jobs')
+        self.assertNotIn('8080:80', report)
+        with self.assertRaisesRegex(appctl.DeployError, 'Unknown service missing in demo. Available: api, worker'):
+            self.inspect('missing')
+
     def test_direct_named_volume_blocks_other_projects_and_survives_removal(self):
         self.desired = {'web.container': quadlet('Volume=app_data:/data\n')}
         self.assertEqual(self.deploy(), 'success')
