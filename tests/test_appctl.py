@@ -35,6 +35,8 @@ class DeployTests(unittest.TestCase):
         self.invocations = {}
         self.jobs = set()
         self.volumes = set()
+        self.image_cached = True
+        self.pulls = []
         self.calls = []
         self.preflight_sources = set()
         self.preflight_invalid = set()
@@ -70,6 +72,12 @@ class DeployTests(unittest.TestCase):
             return SimpleNamespace(stdout='\n'.join(generated), stderr='bad generator input', returncode=code)
         if args[:4] == ('podman', 'image', 'inspect', '--format'):
             return SimpleNamespace(stdout='sha256:test-image\n')
+        if args[:2] == ('podman', 'pull'):
+            if '--policy' in args:
+                raise appctl.CommandError(args, 125, '', 'Error: unknown flag: --policy')
+            self.pulls.append(args)
+            self.image_cached = True
+            return SimpleNamespace(stdout='sha256:test-image\n')
         self.fail(f'Unexpected command {args}')
 
     def exists(self, kind, name):
@@ -77,7 +85,7 @@ class DeployTests(unittest.TestCase):
             return name in self.volumes
         if kind == 'container':
             return name in self.running.values()
-        return kind == 'image'
+        return kind == 'image' and self.image_cached
 
     def inspect_container(self, name):
         for unit, container in self.running.items():
@@ -132,7 +140,7 @@ class DeployTests(unittest.TestCase):
             elif action == 'start' and (unit not in self.running or unit in self.jobs):
                 self.start(unit)
 
-    def deploy(self, app='demo', force=False):
+    def deploy(self, app='demo', force=False, pull=False):
         appdir = self.apps / app
         appdir.mkdir(exist_ok=True)
         (appdir / 'compose.yml').touch()
@@ -141,11 +149,25 @@ class DeployTests(unittest.TestCase):
         self.old_files = {name for previous in self.state.iterdir()
                           for name in self.manifest(previous.name).get('files', {})}
         with redirect_stdout(StringIO()):
-            return appctl.deploy(SimpleNamespace(app=app, force=force, pull=False), project,
+            return appctl.deploy(SimpleNamespace(app=app, force=force, pull=pull), project,
                                  lambda action, **fields: None)
 
     def manifest(self, app='demo'):
         return appctl.load(self.state / app / 'manifest.json', {})
+
+    def test_deploy_pulls_missing_and_explicitly_refreshed_images(self):
+        self.desired = {'web.container': quadlet()}
+        self.image_cached = False
+        pull = ('podman', 'pull', '--quiet', 'docker.io/library/nginx:test')
+        self.assertEqual(self.deploy(), 'success')
+        self.assertEqual(self.pulls, [pull])
+
+        self.calls.clear()
+        self.assertEqual(self.deploy(), 'noop')
+        self.assertEqual(self.pulls, [pull])
+        self.assertEqual(self.deploy(pull=True), 'noop')
+        self.assertEqual(self.pulls, [pull, pull])
+        self.assertEqual(self.calls, [])
 
     def inspect(self, *selectors):
         compose = self.apps / 'demo/compose.yml'

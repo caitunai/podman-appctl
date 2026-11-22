@@ -761,7 +761,8 @@ def deploy(args, project, event):
             if image not in images:
                 if args.pull or not exists('image',image):
                     OUT.line('PULL', short_image(image))
-                    run('podman','pull','--quiet','--policy','always',image,capture=False)
+                    # podman pull defaults to always, including versions without --policy.
+                    run('podman', 'pull', '--quiet', image, capture=False)
                     event('image_pulled',image=image)
                 else: event('image_cached',image=image)
                 images[image]=run('podman','image','inspect','--format','{{.Id}}',image).stdout.strip()
