@@ -35,6 +35,9 @@ class DeployTests(unittest.TestCase):
         self.invocations = {}
         self.jobs = set()
         self.volumes = set()
+        self.networks = set()
+        self.resources_in_use = set()
+        self.fail_resource_removal = set()
         self.image_cached = True
         self.pulls = []
         self.calls = []
@@ -78,6 +81,21 @@ class DeployTests(unittest.TestCase):
             self.pulls.append(args)
             self.image_cached = True
             return SimpleNamespace(stdout='sha256:test-image\n')
+        if args[:2] in (('podman', 'volume'), ('podman', 'network')):
+            self.calls.append(args)
+            kind = args[1]
+            resources = self.volumes if kind == 'volume' else self.networks
+            if args[2:] == ('ls', '--format', '{{.Name}}'):
+                return SimpleNamespace(stdout='\n'.join(sorted(resources)))
+            if len(args) == 5 and args[2:4] == ('rm', '--'):
+                name = args[4]
+                self.assertIn(name, resources)
+                if (kind, name) in self.fail_resource_removal:
+                    raise appctl.CommandError(args, 125, '', 'resource removal failed')
+                if (kind, name) in self.resources_in_use:
+                    return SimpleNamespace(returncode=2)
+                resources.remove(name)
+                return SimpleNamespace(returncode=0)
         self.fail(f'Unexpected command {args}')
 
     def exists(self, kind, name):
@@ -154,6 +172,150 @@ class DeployTests(unittest.TestCase):
 
     def manifest(self, app='demo'):
         return appctl.load(self.state / app / 'manifest.json', {})
+
+    def remove(self, *args, expected=0):
+        output = StringIO()
+        with patch.object(appctl, 'OUT', appctl.Output()), patch.object(appctl, 'configure'), \
+                patch.object(appctl.shutil, 'which', side_effect=lambda cmd: cmd if cmd != 'podlet' else None), \
+                patch.object(appctl.os, 'umask'), patch.dict(os.environ), \
+                redirect_stdout(output), redirect_stderr(output):
+            result = appctl.main(['remove', 'demo', *args, '--no-color'])
+        self.assertEqual(result, expected, output.getvalue())
+        history = self.state / 'demo' / 'history'
+        return output.getvalue(), appctl.load(max(history.glob('*.json')), {})
+
+    def test_remove_one_service_preserves_resources_and_compose_by_default(self):
+        self.desired = {
+            'api.container': quadlet('Volume=api-data:/data\nNetwork=app.network\n'),
+            'web.container': quadlet(),
+            'app.network': '[Network]\nNetworkName=app-net\n',
+        }
+        self.deploy()
+        self.networks.add('app-net')
+        self.calls.clear()
+
+        report, record = self.remove('api')
+
+        self.assertIn('api.service removed', report)
+        self.assertEqual(record['result'], 'success')
+        self.assertEqual(record['options'], {'volumes': False, 'networks': False})
+        self.assertEqual(self.calls, [('stop', 'api.service'), ('daemon-reload',)])
+        self.assertEqual(set(self.running), {'web.service'})
+        self.assertFalse((self.quad / 'api.container').exists())
+        self.assertTrue((self.quad / 'app.network').is_file())
+        self.assertEqual(self.volumes, {'api-data'})
+        self.assertEqual(self.networks, {'app-net'})
+        self.assertEqual(self.manifest()['named_volumes'], ['api-data'])
+        state = appctl.load(self.state / 'demo/state.json', {})
+        self.assertEqual(set(state), {'web.container'})
+        self.assertTrue((self.apps / 'demo/compose.yml').is_file())
+        self.assertEqual(self.deploy(), 'success')
+        self.assertIn('api.service', self.running)
+
+    def test_remove_with_flags_preserves_resources_for_other_stopped_services(self):
+        bind = self.base / 'config.json'
+        bind.write_text('{}')
+        self.desired = {
+            'api.container': quadlet(
+                f'Volume={bind}:/config:ro\nVolume=shared.volume:/shared\n'
+                'Mount=type=volume,source=api-data,target=/data\n'
+                'Network=shared.network:alias=api\nNetwork=api.network\n'
+            ),
+            'web.container': quadlet('Volume=shared-data:/shared\nNetwork=shared-net\n'),
+            'shared.volume': '[Volume]\nVolumeName=shared-data\n',
+            'shared.network': '[Network]\nNetworkName=shared-net\n',
+            'api.network': '[Network]\nNetworkName=api-net\n',
+        }
+        self.deploy()
+        self.system('stop', 'web.service')
+        self.networks.update(('api-net', 'shared-net'))
+        self.calls.clear()
+
+        report, record = self.remove('api', '--volumes', '--networks')
+
+        self.assertEqual(record['options'], {'volumes': True, 'networks': True})
+        self.assertIn('used by web', report)
+        self.assertEqual(self.volumes, {'shared-data'})
+        self.assertEqual(self.networks, {'shared-net'})
+        self.assertFalse((self.quad / 'api.network').exists())
+        self.assertTrue((self.quad / 'shared.network').is_file())
+        self.assertTrue((self.quad / 'shared.volume').is_file())
+        self.assertTrue((self.quad / 'web.container').is_file())
+        self.assertEqual(bind.read_text(), '{}')
+        self.assertIn(('podman', 'network', 'rm', '--', 'api-net'), self.calls)
+        self.assertIn(('podman', 'volume', 'rm', '--', 'api-data'), self.calls)
+
+    def test_project_remove_can_delete_retained_resources_and_skip_in_use_resources(self):
+        self.desired = {
+            'web.container': quadlet('Volume=data.volume:/data\nVolume=old.volume:/old\nNetwork=app.network\n'),
+            'data.volume': '[Volume]\nVolumeName=app-data\n',
+            'old.volume': '[Volume]\nVolumeName=old-data\n',
+            'app.network': '[Network]\nNetworkName=app-net\n',
+        }
+        self.deploy()
+        self.volumes.update(('app-data', 'old-data-unrelated'))
+        self.networks.add('app-net')
+        self.remove()
+        self.assertEqual(set(self.manifest()['files']), {'data.volume', 'old.volume', 'app.network'})
+        self.resources_in_use.add(('network', 'app-net'))
+
+        report, record = self.remove('--volumes', '--networks')
+
+        self.assertEqual(record['result'], 'success')
+        self.assertIn('in use by Podman', report)
+        self.assertEqual(self.volumes, {'old-data-unrelated'})
+        self.assertEqual(self.networks, {'app-net'})
+        self.assertEqual(set(self.manifest()['files']), {'app.network'})
+        self.resources_in_use.clear()
+        self.remove('--networks')
+        self.assertFalse(self.networks)
+        self.assertEqual(self.manifest()['files'], {})
+        self.assertEqual(self.remove()[1]['result'], 'noop')
+
+    def test_remove_rejects_removing_a_dependency_of_a_remaining_service(self):
+        self.desired = {
+            'db.container': quadlet(),
+            'api.container': quadlet(unit='Requires=db.service\n'),
+        }
+        self.deploy()
+        self.calls.clear()
+
+        report, _ = self.remove('db', expected=1)
+
+        self.assertIn('api depends on db.service', report)
+        self.assertEqual(self.calls, [])
+        self.assertEqual(set(self.running), {'api.service', 'db.service'})
+
+    def test_remove_rejects_a_runtime_container_owned_by_another_unit(self):
+        self.desired = {'web.container': quadlet()}
+        self.deploy()
+        self.calls.clear()
+        foreign = {'Config': {'Labels': {'PODMAN_SYSTEMD_UNIT': 'other.service'}}}
+
+        with patch.object(appctl, 'inspect_container', return_value=foreign):
+            report, _ = self.remove('web', '--volumes', expected=1)
+
+        self.assertIn('unverified owner', report)
+        self.assertEqual(self.calls, [])
+        self.assertTrue((self.quad / 'web.container').is_file())
+
+    def test_remove_retries_the_original_resource_selection_after_interruption(self):
+        self.desired = {'web.container': quadlet('Volume=app-data:/data\n')}
+        self.deploy()
+        self.fail_resource_removal.add(('volume', 'app-data'))
+
+        self.remove('web', '--volumes', expected=1)
+        self.assertFalse((self.quad / 'web.container').exists())
+        self.assertEqual(self.volumes, {'app-data'})
+        self.assertEqual(self.manifest()['remove_pending']['services'], ['web.container'])
+        self.assertIn('Retry with appctl remove demo web --volumes', self.remove('web', expected=1)[0])
+        self.fail_resource_removal.clear()
+
+        self.remove('web', '--volumes')
+
+        self.assertFalse(self.volumes)
+        self.assertNotIn('remove_pending', self.manifest())
+        self.assertEqual(self.manifest()['files'], {})
 
     def test_deploy_pulls_missing_and_explicitly_refreshed_images(self):
         self.desired = {'web.container': quadlet()}

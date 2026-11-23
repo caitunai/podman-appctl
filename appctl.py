@@ -4,6 +4,7 @@
 # Usage (run as the configured non-root deployment account):
 #   appctl deploy APP [--pull] [--force]
 #   appctl {start,stop,restart,status} APP [SERVICE]
+#   appctl remove APP [SERVICE] [--volumes] [--networks]
 #   appctl stats APP [SERVICE] [--no-stream] [--interval SECONDS | --processes]
 #   appctl inspect APP [SERVICE]
 #   appctl logs APP [SERVICE] [-n N] [-f] [--since TIME] [--source journald|podman]
@@ -45,7 +46,8 @@
 #   * stats shows Podman resource usage or a snapshot of container processes.
 #   * inspect lists ports and mounts from the current Compose file.
 #   * logs reads deployed containers' stdout and stderr from journald or Podman.
-#   * JSON history for deploy/start/stop/restart, including failure and no-op;
+#   * remove uninstalls deployed services, with opt-in named volume and network cleanup.
+#   * JSON history for deploy/start/stop/restart/remove, including failure and no-op;
 #     read-only status/history calls are not logged. No config values in history.
 #     Retain 90 days AND at most 100 attempts/project (constants below).
 #     GC runs on every mutating deployment/control, across all projects.
@@ -135,7 +137,7 @@ class Output:
     def line(self, label, message, detail=None):
         colors = {'OK':'32','DONE':'32','START':'36','STOP':'36','RESTART':'36',
                   'PULL':'36','CACHE':'2','SKIP':'2','PLAN':'33','REMOVE':'33',
-                  'WARN':'33','ERROR':'31','INFO':'36','INSTALL':'36','GC':'36'}
+                  'WARN':'33','ERROR':'31','INFO':'36','INSTALL':'36','GC':'36','KEEP':'2'}
         print('  ' + self.style(f'{label:<8}', colors.get(label, '0')) + str(message), flush=True)
         if detail: print('           ' + self.style(str(detail), '2'), flush=True)
     def diagnostic(self, message, stream=None):
@@ -163,7 +165,8 @@ class Output:
     def summary(self, result, seconds, events):
         counts = Counter(e['action'] for e in events)
         fields = [('restarted','updated'),('started','started'),('stopped','stopped'),
-                  ('removed','removed'),('skip','unchanged'),('image_pulled','pulled'),
+                  ('removed','removed'),('resource_removed','resources removed'),
+                  ('skip','unchanged'),('image_pulled','pulled'),
                   ('image_cached','cached')]
         stats = '  |  '.join(f'{counts[k]} {label}' for k,label in fields if counts[k])
         print('\n' + self.style('-' * 64, '2'), flush=True)
@@ -770,6 +773,8 @@ def deploy(args, project, event):
     compose = compose_path(app)
     mp=project/'manifest.json'; sp=project/'state.json'
     manifest = load_manifest(mp)
+    if manifest.get('remove_pending'):
+        fail(removal_retry(args.app, manifest['remove_pending']))
     owned = manifest['files']
     state=load(sp,{})
     OUT.phase('[1/4] Generate & validate Quadlet')
@@ -898,6 +903,8 @@ def managed_services(args, project):
     if not mp.is_file():
         fail(f'Project not managed: {args.app}; run appctl deploy first')
     manifest = load_manifest(mp)
+    if manifest.get('remove_pending') and args.command in ('start', 'restart'):
+        fail(removal_retry(args.app, manifest['remove_pending']))
     if manifest.get('reload_pending') and args.command in ('start','restart'):
         fail('Previous deployment incomplete; run appctl deploy first')
     selected = container_services(manifest)
@@ -1293,6 +1300,199 @@ def control(args, project, event):
     return 'success'
 
 
+def removal_retry(app, plan):
+    request = plan['request']
+    command = ['appctl', 'remove', app]
+    if request['service']:
+        command.append(request['service'])
+    command.extend(f'--{flag}' for flag in ('volumes', 'networks') if request[flag])
+    return 'Previous removal incomplete. Retry with ' + shlex.join(command)
+
+
+def removal_unit(filename, meta):
+    path = QUAD / filename
+    if path.name != filename or path.suffix != f'.{meta["kind"]}':
+        fail(f'Invalid managed filename: {filename}')
+    literal(path.stem, 'Quadlet name')
+    literal(meta['unit'], 'unit name')
+    if path.is_symlink() or (path.exists() and (not path.is_file() or metadata(path) != meta)):
+        fail(f'Managed Quadlet identity differs: {path}')
+    info = unit_info(meta['unit'])
+    if info['LoadState'] != 'not-found' and not same_path(info.get('SourcePath'), path):
+        fail(f'Systemd unit conflict: {meta["unit"]}')
+    return info
+
+
+def service_resource_refs(filename, files):
+    fields = parse(QUAD / filename)['Container']
+    mounts = {('volume', name) for name in volume_mounts(fields)}
+    networks = list(fields.get('Network', []))
+    # Network can also be set in a local Quadlet drop-in.
+    for directory in dropin_dirs(QUAD, filename):
+        for dropin in directory.glob('*.conf'):
+            networks.extend(parse(dropin).get('Container', {}).get('Network', []))
+    mounts.update(('network', spec.strip('"').split(':', 1)[0]) for spec in networks)
+    refs = set()
+    for kind, name in mounts:
+        meta = files.get(name)
+        refs.add((kind, meta['resource'] if meta and meta['kind'] == kind else name))
+    return refs
+
+
+def removal_resources(args, manifest, selected, kept, resource_files, event):
+    kinds = {kind for kind, enabled in (('volume', args.volumes), ('network', args.networks)) if enabled}
+    candidates = set(resource_files) | {('volume', name) for name in manifest['named_volumes']}
+    candidates = {key for key in candidates if key[0] in kinds}
+    if not args.service or not candidates:
+        return candidates
+
+    filename = next(iter(selected))
+    if not (QUAD / filename).is_file():
+        fail(f'Cannot determine resources for {filename}. Its installed Quadlet is missing.')
+    candidates &= service_resource_refs(filename, manifest['files'])
+    for name, info in kept.items():
+        if not candidates:
+            break
+        if not (QUAD / name).is_file():
+            fail(f'Cannot verify shared resources. Installed Quadlet {name} is missing.')
+        refs = service_resource_refs(name, manifest['files'])
+        dependencies = {unit for key in ('Requires', 'Requisite', 'BindsTo', 'PartOf')
+                        for unit in info.get(key, '').split()}
+        refs.update(key for key, resource_file in resource_files.items()
+                    if manifest['files'][resource_file]['unit'] in dependencies)
+        for kind, resource in sorted(candidates & refs):
+            event('resource_kept', kind=kind, resource=resource, reason=f'used by {Path(name).stem}')
+        candidates -= refs
+    return candidates
+
+
+def check_removal_ownership(app, targets, resources):
+    names = {('file', name) for name in targets}
+    names.update(('unit', meta['unit']) for meta in targets.values())
+    names.update((meta['kind'], meta['resource']) for meta in targets.values())
+    names.update(resources)
+    for other, manifest in project_manifests(app):
+        for name, meta in manifest['files'].items():
+            if names.intersection((('file', name), ('unit', meta['unit']), (meta['kind'], meta['resource']))):
+                fail(f'Removal conflicts with resources owned by project {other}')
+        if any(('volume', name) in names for name in manifest['named_volumes']):
+            fail(f'Removal conflicts with a volume owned by project {other}')
+
+
+def remove_deployment(args, project, event):
+    mp = project / 'manifest.json'
+    if not mp.is_file():
+        fail(f'Project not managed: {args.app}. Run appctl deploy first.')
+    manifest = load_manifest(mp)
+    files = manifest['files']
+    services = container_services(manifest)
+    resource_files = {(meta['kind'], meta['resource']): name for name, meta in files.items()
+                      if meta['kind'] in ('network', 'volume')}
+    request = {key: getattr(args, key) for key in ('service', 'volumes', 'networks')}
+    pending = manifest.get('remove_pending')
+    if pending:
+        if pending['request'] != request:
+            fail(removal_retry(args.app, pending))
+        selected = {filename: services[filename] for filename in pending['services']}
+    elif args.service:
+        _, selected = managed_services(args, project)
+    else:
+        selected = services
+
+    # Removing a unit can propagate a stop to dependent services.
+    kept = {name: unit_info(meta['unit']) for name, meta in services.items() if name not in selected}
+    removed_units = {meta['unit'] for meta in selected.values()}
+    for filename, info in kept.items():
+        dependencies = {unit for key in ('Requires', 'Requisite', 'BindsTo', 'PartOf')
+                        for unit in info.get(key, '').split()}
+        blocked = dependencies & removed_units
+        if blocked:
+            fail(f'{Path(filename).stem} depends on ' + ', '.join(sorted(blocked)))
+
+    if pending:
+        resources = {tuple(key) for key in pending['resources']}
+    else:
+        resources = removal_resources(args, manifest, selected, kept, resource_files, event)
+    if not selected and not resources:
+        return 'noop'
+    targets = {**selected, **{resource_files[key]: files[resource_files[key]]
+                              for key in resources if key in resource_files}}
+    check_removal_ownership(args.app, targets, resources)
+    for filename, meta in targets.items():
+        removal_unit(filename, meta)
+    owners = {}
+    for meta in selected.values():
+        owners.setdefault(meta['resource'], set()).add(meta['unit'])
+    for name, units in owners.items():
+        assert_container_owner(name, units)
+    for kind, resource in resources:
+        literal(resource, f'{kind} name')
+
+    manifest['remove_pending'] = {'request': request, 'services': sorted(selected), 'resources': sorted(resources)}
+    save(mp, manifest)
+
+    for filename, meta in selected.items():
+        event('remove_begin', unit=meta['unit'])
+        if removal_unit(filename, meta)['LoadState'] != 'not-found':
+            system('stop', meta['unit'], capture=False)
+    for name, units in owners.items():
+        container = assert_container_owner(name, units)
+        if container:
+            run('podman', 'container', 'rm', '--', require_container_id(container, name), capture=False)
+    for filename in selected:
+        (QUAD / filename).unlink(missing_ok=True)
+    if selected:
+        reload_units()
+        for unit in removed_units:
+            if unit_info(unit)['LoadState'] != 'not-found':
+                fail(f'Removed unit still loaded: {unit}')
+
+    # Podman rm accepts partial names for some resource types. Only pass names
+    # that exist exactly, and let Podman protect resources attached to containers.
+    present = {kind: set(run('podman', kind, 'ls', '--format', '{{.Name}}').stdout.splitlines())
+               for kind in sorted({kind for kind, _ in resources})}
+    removed_resources = set()
+    removed_files = dict(selected)
+    for kind, resource in sorted(resources):
+        if resource in present[kind]:
+            result = run('podman', kind, 'rm', '--', resource, ok=(0, 1, 2))
+            if result.returncode == 2:
+                event('resource_kept', kind=kind, resource=resource, reason='in use by Podman')
+                continue
+        filename = resource_files.get((kind, resource))
+        if filename:
+            meta = files[filename]
+            if removal_unit(filename, meta)['LoadState'] != 'not-found':
+                system('stop', meta['unit'], capture=False)
+            (QUAD / filename).unlink(missing_ok=True)
+            removed_files[filename] = meta
+        removed_resources.add((kind, resource))
+    if removed_files.keys() != selected.keys():
+        reload_units()
+        for filename in removed_files.keys() - selected.keys():
+            unit = removed_files[filename]['unit']
+            if unit_info(unit)['LoadState'] != 'not-found':
+                fail(f'Removed unit still loaded: {unit}')
+
+    state_path = project / 'state.json'
+    state = load(state_path, {})
+    if selected:
+        save(state_path, {filename: data for filename, data in state.items() if filename not in selected})
+    for filename in removed_files:
+        files.pop(filename)
+    manifest['named_volumes'] = [name for name in manifest['named_volumes']
+                                 if ('volume', name) not in removed_resources]
+    manifest.pop('remove_pending')
+    if not kept:
+        manifest['reload_pending'] = False
+    save(mp, manifest)
+    for meta in selected.values():
+        event('removed', unit=meta['unit'])
+    for kind, resource in sorted(removed_resources):
+        event('resource_removed', kind=kind, resource=resource)
+    return 'success' if selected or removed_resources else 'noop'
+
+
 def parse_args(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(
@@ -1314,6 +1514,7 @@ def parse_args(argv=None):
         ('start', 'Start deployed services'),
         ('stop', 'Temporarily stop deployed services'),
         ('restart', 'Restart deployed services'),
+        ('remove', 'Remove deployed services and optionally their resources'),
         ('status', 'Show systemd and Podman runtime state'),
         ('stats', 'Show resource usage or processes for deployed containers'),
         ('inspect', 'Show ports and mounts declared in compose.yml'),
@@ -1323,6 +1524,9 @@ def parse_args(argv=None):
         p.add_argument('app',help=f'Project directory under APPCTL_BASE_DIR (default: {DEFAULT_BASE_DIR})')
         scope = 'all services in compose.yml' if action == 'inspect' else 'all owned container services'
         p.add_argument('service', nargs='?', help=f'Compose service name (default: {scope})')
+        if action == 'remove':
+            p.add_argument('--volumes', action='store_true', help='Delete unused managed named volumes and their data')
+            p.add_argument('--networks', action='store_true', help='Delete unused managed Podman networks')
         if action == 'stats':
             p.add_argument('--no-stream', action='store_true', help='Show one resource usage sample')
             mode = p.add_mutually_exclusive_group()
@@ -1359,7 +1563,7 @@ def main(argv=None):
     configure()
     if OUT.verbose:
         OUT.line('INFO', f'User: {DEPLOY_USER} | Base: {BASE} | Podman target: {PODMAN_VERSION}')
-    required = ['podman', 'systemctl'] if args.command in ('deploy', 'start', 'stop', 'restart', 'status') else []
+    required = ['podman', 'systemctl'] if args.command in ('deploy', 'start', 'stop', 'restart', 'remove', 'status') else []
     if args.command in ('deploy', 'inspect'):
         required.append('podlet')
     if args.command == 'logs':
@@ -1407,9 +1611,10 @@ def main(argv=None):
         if args.command=='deploy': QUAD.mkdir(parents=True,exist_ok=True)
         project.mkdir(parents=True,exist_ok=True)
         hist=project/'history'/(dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')+'-'+uuid.uuid4().hex[:8]+'.json')
+        option_names = ('volumes', 'networks') if args.command == 'remove' else ('pull', 'force')
         record={'version':VERSION,'app':args.app,'command':args.command,'service':getattr(args,'service',None),
                 'started_at':now(),'result':'running',
-                'options':{k:getattr(args,k,False) for k in ('pull','force')},'events':[]}
+                'options':{k:getattr(args,k,False) for k in option_names},'events':[]}
         save(hist,record)
         def event(action,**fields):
             record['events'].append({'at':now(),'action':action,**fields}); save(hist,record)
@@ -1422,13 +1627,17 @@ def main(argv=None):
                 OUT.line('PLAN' if action=='plan_update' else 'SKIP',unit,detail)
             elif action=='installed': OUT.line('INSTALL',fields['file'])
             elif action.endswith('_begin'): OUT.line(action.split('_')[0].upper(),unit)
+            elif action in ('resource_kept', 'resource_removed'):
+                label = 'KEEP' if action == 'resource_kept' else 'OK'
+                OUT.line(label, f'{fields["kind"]} {fields["resource"]} {action.split("_")[1]}', reason)
             elif action in ('restarted','started','stopped','removed'):
                 detail=short_image(image)+' @ '+fields['image_id'].removeprefix('sha256:')[:12] if image and fields.get('image_id') else None
                 OUT.line('OK',f'{unit} {action}',detail)
             else: OUT.line('INFO',action+' '+unit)
         rc=0
         try:
-            record['result']=deploy(args,project,event) if args.command=='deploy' else control(args,project,event)
+            operation = {'deploy': deploy, 'remove': remove_deployment}.get(args.command, control)
+            record['result'] = operation(args, project, event)
         except (Exception, KeyboardInterrupt) as e:
             record['result']='failed'; rc=130 if isinstance(e,KeyboardInterrupt) else 1
             record['error']=str(e) if isinstance(e,DeployError) else type(e).__name__

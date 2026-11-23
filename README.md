@@ -17,7 +17,7 @@ Designed for self-hosted applications, single-server deployments, and CI/CD work
 - **Local image caching** — reuse existing versioned images; explicitly refresh remote images with `--pull`.
 - **Application lifecycle management** — start, stop, restart, and check the runtime state of a project or one service.
 - **Compose resource inspection** — list published ports, exposed ports, volumes, and file mounts before deployment.
-- **Ownership-aware cleanup** — remove services deleted from Compose without deleting application data, volumes, networks, or images.
+- **Ownership-aware cleanup** — remove services explicitly or through Compose changes. Explicit removal can also delete unused managed named volumes and networks.
 - **Conflict detection** — check project ownership, unit names, and container/resource names before applying changes.
 - **Deployment and operation history** — record structured JSON events, durations, outcomes, and image information, with automatic retention limits.
 - **Concurrent operation protection** — serialize appctl operations for the deployment account using a file lock.
@@ -237,6 +237,7 @@ appctl deploy APP [--pull] [--force]
 appctl start APP [SERVICE]
 appctl stop APP [SERVICE]
 appctl restart APP [SERVICE]
+appctl remove APP [SERVICE] [--volumes] [--networks]
 appctl status APP [SERVICE]
 appctl stats APP [SERVICE] [--no-stream] [--interval SECONDS | --processes]
 appctl inspect APP [SERVICE]
@@ -255,6 +256,7 @@ appctl --version
 | `start` | Start already-deployed services using installed Quadlet definitions. |
 | `stop` | Temporarily stop already-deployed services without deleting deployment definitions or application data. |
 | `restart` | Restart already-deployed services using installed definitions. |
+| `remove` | Stop and uninstall deployed services. Keep named volumes and networks by default. |
 | `status` | Show systemd and container state, images, deployment times, and uptime. |
 | `stats` | Stream Podman resource usage or list individual processes for deployed containers. |
 | `inspect` | Show ports and mounts declared in the current Compose file for a project or one service. |
@@ -275,6 +277,24 @@ appctl stats myapp --no-stream
 appctl history myapp --limit 50
 appctl gc
 ```
+
+### Remove deployed services
+
+```bash
+appctl remove myapp myapp-api
+appctl remove myapp myapp-api --volumes --networks
+appctl remove myapp
+appctl remove myapp --volumes --networks
+```
+
+`remove` stops the selected services, removes their container Quadlet definitions and deployment state, and reloads the systemd user manager. Omit `SERVICE` to remove every deployed service in the project. If a remaining service depends on the selected service, remove or update the dependent service first.
+
+- `--volumes` deletes unused, project-owned named volumes and **permanently deletes their data**.
+- `--networks` deletes unused, project-owned Podman networks.
+
+With a service name, the options cover resources referenced by that service's installed definition. Resources shared with another deployed service in the project are kept, including when that service is stopped. Podman also protects resources still attached to other containers. Without a service name, the options cover the project's registered resources, including resources kept by earlier removals.
+
+By default, named volumes and networks are kept. Bind-mounted files and directories, local images, Compose files, and operation history are preserved. Quadlet may clean up anonymous volumes when it removes a container. If the removed service is still declared in Compose, the next `deploy` recreates it. If removal is interrupted, retry the same command with the same options.
 
 ### Deployment time and uptime
 
@@ -406,7 +426,7 @@ By design, appctl rejects unmanaged Quadlets or runtime objects with conflicting
         └── <timestamp>-<id>.json
 ```
 
-Deploy, start, stop, and restart operations record successes, failures, and no-op results. `status` and `history` are read-only operations and are not recorded as history entries. An interrupted operation may leave a `running` history entry. Records include event details and image identities where available; configuration values are not intentionally recorded. Keep credentials out of image references and review diagnostic output before sharing it.
+Deploy, start, stop, restart, and remove operations record successes, failures, and no-op results. `status` and `history` are read-only operations and are not recorded as history entries. An interrupted operation may leave a `running` history entry. Records include event details and image identities where available; configuration values are not intentionally recorded. Keep credentials out of image references and review diagnostic output before sharing it.
 
 History is automatically pruned on mutating operations across all projects. Defaults are **90 days and at most 100 records per project**. Change `DAYS` and `MAX_HISTORY` in the script to adjust retention. `appctl gc` also removes expired abandoned state-write temporary files. Current ownership manifests and active deployment state are not age-pruned.
 
@@ -456,7 +476,7 @@ appctl focuses on ordinary long-running, image-based services in a single rootle
 - Multi-host scheduling, high availability, load balancing, or image building.
 - Arbitrary Compose/Quadlet features, including pods, build/image units, oneshot/template units, custom aliases, dynamic resource specifiers, or raw `PodmanArgs`/`GlobalArgs`.
 - Recursive configuration-directory hashing, secret-value change tracking, comprehensive host-port conflict auditing, or full detection of external runtime changes.
-- Automatic adoption of existing services, persistent enable/disable commands, or automatic deletion of networks, volumes, or images.
+- Automatic adoption of existing services, persistent enable/disable commands, or automatic image cleanup.
 
 Use static, unique resource names, explicit bind paths and `pull_policy: never`. Keep identity, mount, and lifecycle settings in Compose instead of overriding them in local drop-ins. Validate changes on a non-production host before deploying. This is a trusted-operator tool, not a multi-tenant security boundary.
 
