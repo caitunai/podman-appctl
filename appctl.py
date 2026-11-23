@@ -266,15 +266,20 @@ def inspect_container(name):
     if not exists('container', name): return None
     return json.loads(run('podman','container','inspect',name).stdout)[0]
 
+
+def assert_container_owner(name, allowed_units):
+    container = inspect_container(name)
+    if container is not None:
+        labels = container.get('Config', {}).get('Labels') or {}
+        if labels.get('PODMAN_SYSTEMD_UNIT') not in allowed_units:
+            fail(f'Container name conflict or unverified owner: {name}')
+    return container
+
+
 def assert_runtime(meta, allowed):
     kind, name, unit = meta['kind'], meta['resource'], meta['unit']
     if kind == 'container':
-        obj = inspect_container(name)
-        if obj is not None:
-            labels = obj.get('Config', {}).get('Labels') or {}
-            if not allowed or labels.get('PODMAN_SYSTEMD_UNIT') != unit:
-                fail(f'Container name conflict or unverified owner: {name}')
-        return obj
+        return assert_container_owner(name, (unit,) if allowed else ())
     if exists(kind, name) and not allowed:
         fail(f'Existing unmanaged {kind}: {name}')
     return None
@@ -490,11 +495,13 @@ def check_collisions(app, desired, manifest, requested_volumes):
             if k in keys: fail(f'Name conflict {k}: owned by project {keys[k]}')
             if k in seen: fail(f'Duplicate name in project: {k}')
             seen.add(k)
-        # No rename/reuse of an existing owned identity within the same transaction.
+        # A renamed service may take over a container name from a removed service.
         for oldf,old in owned.items():
             if oldf == f:
                 if old != m: fail(f'Identity changed for {f}; manual migration required')
-            elif old['unit']==m['unit'] or (old['kind'],old['resource'])==(m['kind'],m['resource']):
+                continue
+            same_resource = (old['kind'], old['resource']) == (m['kind'], m['resource'])
+            if old['unit'] == m['unit'] or (same_resource and (m['kind'] != 'container' or oldf in desired)):
                 fail(f'Name {f} conflicts with reserved {oldf}; remove it first')
     owned_volumes = volume_names(owned)
     desired_volumes = volume_names(desired)
@@ -527,6 +534,7 @@ def check_collisions(app, desired, manifest, requested_volumes):
         if group == 'Container' and named_volumes(fields) & (claims | desired_volumes):
             fail(f'Named volume conflict with existing Quadlet: {p}')
 
+    container_owners = {}
     for f,m in {**owned,**desired}.items():
         dest=QUAD/f; info=unit_info(m['unit'])
         source_ok=same_path(info.get('SourcePath'),dest)
@@ -540,7 +548,16 @@ def check_collisions(app, desired, manifest, requested_volumes):
             fail(f'Unmanaged Quadlet: {dest}; refusing to overwrite. Resolve ownership manually.')
         elif not allowed and source_ok and info['LoadState']!='not-found':
             fail(f'Unmanaged generated unit: {m["unit"]}')
-        assert_runtime(m, allowed)
+        if m['kind'] == 'container':
+            owners = container_owners.setdefault(m['resource'], set())
+            if allowed:
+                owners.add(m['unit'])
+        else:
+            assert_runtime(m, allowed)
+    # A pending handoff can reserve the same name for both the old and new
+    # units. Only the units already registered for that name can own it.
+    for name, owners in container_owners.items():
+        assert_container_owner(name, owners)
     return claims
 
 
@@ -686,6 +703,27 @@ def invalidate_service(state, filename):
         state[filename] = {'deployed_at': previous['deployed_at']}
 
 
+def stop_stale_containers(stale, registered_replacements, event):
+    remaining = Counter(meta['resource'] for meta in stale.values())
+    for filename, meta in stale.items():
+        unit, resource = meta['unit'], meta['resource']
+        event('remove_begin', unit=unit)
+        info = unit_info(unit)
+        if info['LoadState'] != 'not-found':
+            if not same_path(info.get('SourcePath'), QUAD / filename):
+                fail(f'Systemd unit conflict: {unit}')
+            system('stop', unit, capture=False)
+        remaining[resource] -= 1
+        if remaining[resource]:
+            continue
+        replacement = registered_replacements.get(resource)
+        if replacement:
+            # A previous attempt may have started the replacement already.
+            assert_runtime(replacement, True)
+        elif exists('container', resource):
+            fail(f'Container remains after stop: {resource}')
+
+
 def apply_services(containers, units, order, plans, updates, state, state_path, event):
     filenames = {meta['unit']: filename for filename, meta in containers.items()}
     actions = {}
@@ -818,10 +856,8 @@ def deploy(args, project, event):
         # the replacement is running, even when it needs to reuse a released port.
         for f in updates: invalidate_service(state, f)
         save(sp,state)
-        for m in stale.values():
-            event('remove_begin',unit=m['unit'])
-            if unit_info(m['unit'])['LoadState']!='not-found': system('stop',m['unit'],capture=False)
-            if exists('container',m['resource']): fail(f'Container remains after stop: {m["resource"]}')
+        registered_replacements = {m['resource']: m for f, m in containers.items() if f in owned}
+        stop_stale_containers(stale, registered_replacements, event)
         OUT.phase('[4/4] Start / restart & verify')
         actions = apply_services(containers, container_units, order, plans, updates, state, sp, event)
         if not actions: OUT.line('SKIP','No service restart required')

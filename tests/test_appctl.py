@@ -303,6 +303,64 @@ class DeployTests(unittest.TestCase):
         self.assertEqual(self.deploy(), 'success')
         self.assertFalse((self.quad / 'old.container').exists())
 
+    def test_renaming_the_only_service_can_keep_its_container_name(self):
+        definition = quadlet('ContainerName=jielong\nVolume=app_data:/data\n')
+        self.desired = {'jielong.container': definition}
+        self.assertEqual(self.deploy('lx_jielong'), 'success')
+        self.calls.clear()
+        self.desired = {'lx_jielong.container': definition}
+        self.assertEqual(self.deploy('lx_jielong'), 'success')
+        self.assertLess(self.calls.index(('stop', 'jielong.service')),
+                        self.calls.index(('start', 'lx_jielong.service')))
+        self.assertEqual(self.running, {'lx_jielong.service': 'jielong'})
+        self.assertFalse((self.quad / 'jielong.container').exists())
+        manifest = self.manifest('lx_jielong')
+        self.assertEqual(list(manifest['files']), ['lx_jielong.container'])
+        self.assertEqual(manifest['named_volumes'], ['app_data'])
+        self.assertEqual(self.deploy('lx_jielong'), 'noop')
+
+    def test_rename_can_retry_after_the_replacement_has_started(self):
+        definition = quadlet('ContainerName=shared-name\n')
+        self.desired = {'old.container': definition}
+        self.deploy()
+        self.desired = {'new.container': definition}
+        with patch.object(appctl, 'verify_services', side_effect=appctl.DeployError('verification interrupted')):
+            with self.assertRaisesRegex(appctl.DeployError, 'verification interrupted'):
+                self.deploy()
+        self.assertEqual(self.running, {'new.service': 'shared-name'})
+        self.assertTrue((self.quad / 'old.container').is_file())
+        self.assertTrue(self.manifest()['reload_pending'])
+
+        self.assertEqual(self.deploy(), 'success')
+        self.assertEqual(self.running, {'new.service': 'shared-name'})
+        self.assertFalse((self.quad / 'old.container').exists())
+        self.assertFalse(self.manifest()['reload_pending'])
+
+    def test_rename_does_not_take_over_an_unmanaged_container(self):
+        definition = quadlet('ContainerName=shared-name\n')
+        self.desired = {'old.container': definition}
+        self.deploy()
+        self.running = {'outside.service': 'shared-name'}
+        self.desired = {'new.container': definition}
+        self.calls.clear()
+
+        with self.assertRaisesRegex(appctl.DeployError, 'unverified owner: shared-name'):
+            self.deploy()
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.running, {'outside.service': 'shared-name'})
+
+    def test_container_name_stays_reserved_to_its_project(self):
+        definition = quadlet('ContainerName=shared-name\n')
+        self.desired = {'old.container': definition}
+        self.deploy('first')
+        self.desired = {'new.container': definition}
+        self.calls.clear()
+
+        with self.assertRaisesRegex(appctl.DeployError, 'owned by project first'):
+            self.deploy('second')
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.running, {'old.service': 'shared-name'})
+
     def test_required_removed_service_is_rejected_before_stop(self):
         self.desired = {'old.container': quadlet(), 'web.container': quadlet()}
         self.deploy()

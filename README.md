@@ -388,6 +388,8 @@ Generated Quadlets are installed in the deployment user's `$XDG_CONFIG_HOME/cont
 
 If a service is removed from Compose, appctl stops its owned systemd unit. It removes the old `.container` file after the desired services pass runtime verification and prunes its deployment state. A replacement can take over the old service's port after the old service stops. Networks, named volumes, their reserved definitions, local images, and host data remain. Changed network or volume definitions require manual migration. Keep at least one container service in Compose.
 
+A renamed service can keep its `container_name` when the old service is removed from the same project's Compose file. During deployment, appctl verifies ownership, stops the old unit, and starts the new unit with that container name. Keep any data that should survive the rename in named volumes or host bind mounts.
+
 The manifest also reserves named volumes referenced directly by containers, including volumes for which Podlet emits no `.volume` file. Services in the same project can share a named volume. Each named volume is reserved to one project per deployment account.
 
 By design, appctl rejects unmanaged Quadlets or runtime objects with conflicting names and does not automatically adopt pre-existing services. Do not use another deployment tool concurrently against appctl-managed resources or directly edit generated definitions.
