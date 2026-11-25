@@ -82,6 +82,7 @@ import datetime as dt
 import fcntl
 import pwd
 import hashlib
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -1182,6 +1183,80 @@ def systemd_state(info):
     return state + ('*' if info.get('NeedDaemonReload') == 'yes' else '')
 
 
+def list_service_name(app, service):
+    return service if app in service else f'{app}/{service}'
+
+
+def list_service_state(info, container_state):
+    load = info['LoadState']
+    if load != 'loaded':
+        return {'not-found': 'missing', 'bad-setting': 'invalid'}.get(load, load)
+    active = info.get('ActiveState', 'unknown')
+    if active == 'failed':
+        return 'failed'
+    if info.get('SubState') in ('auto-restart', 'auto-restart-queued'):
+        return 'restart'
+    if active in ('activating', 'deactivating', 'reloading', 'refreshing'):
+        return {'activating': 'start', 'deactivating': 'stop',
+                'reloading': 'reload', 'refreshing': 'reload'}[active]
+    if container_state == 'running':
+        return 'up' if active == 'active' else 'run-only'
+    if container_state == 'paused':
+        return 'paused'
+    if active == 'active':
+        return 'no-ctr' if container_state == 'absent' else container_state
+    return 'down' if active == 'inactive' else active
+
+
+def normalize_ip(value):
+    addr = ipaddress.ip_address(value.strip('[]').split('%', 1)[0])
+    return getattr(addr, 'ipv4_mapped', None) or addr
+
+
+def host_interfaces():
+    if not shutil.which('ip'):
+        return {}
+    try:
+        interfaces = json.loads(run('ip', '-j', 'address', 'show').stdout)
+        return {normalize_ip(addr['local']): interface['ifname']
+                for interface in interfaces for addr in interface.get('addr_info', ())
+                if addr.get('family') in ('inet', 'inet6') and addr.get('local')}
+    except (DeployError, OSError, ValueError):
+        return {}
+
+
+def published_ports(ports, interfaces):
+    mappings = []
+    for port in ports:
+        host_port = port.get('host_port')
+        if not host_port:
+            continue
+        host = port.get('host_ip') or '0.0.0.0'
+        try:
+            address = normalize_ip(host)
+        except ValueError:
+            binding = 'bound'
+        else:
+            if address.is_unspecified:
+                binding = 'all'
+            elif address.is_loopback:
+                binding = 'local'
+            else:
+                binding = interfaces.get(address, 'bound')
+        width = port.get('range') or 1
+        target = port.get('container_port')
+        mapping = f'{binding}:{host_port}'
+        if width > 1:
+            mapping += f'-{host_port + width - 1}'
+        if target and target != host_port:
+            mapping += f'->{target}'
+            if width > 1:
+                mapping += f'-{target + width - 1}'
+        for protocol in (port.get('protocol') or 'tcp').split(','):
+            mappings.append(mapping if protocol == 'tcp' else f'{mapping}/{protocol}')
+    return ', '.join(dict.fromkeys(mappings)) or '-'
+
+
 def show_service_list(args):
     if args.app:
         manifest = ROOT / args.app / 'manifest.json'
@@ -1196,7 +1271,8 @@ def show_service_list(args):
         selected.extend((app, filename, services[filename])
                         for filename in sorted(services, key=lambda name: Path(name).stem))
 
-    OUT.header('list', args.app, args.service)
+    target = list_service_name(args.app, args.service) if args.service else args.app
+    OUT.header('list', target)
     if not selected:
         OUT.line('INFO', 'No deployed services')
         return 0
@@ -1204,24 +1280,36 @@ def show_service_list(args):
     # Take one Podman snapshot and match names and ownership labels from the manifest.
     snapshot = json.loads(run('podman', 'ps', '--all', '--format', 'json').stdout)
     containers = {item['Names'][0]: item for item in snapshot if item.get('Names')}
+    observed = int(time.time())
+    interfaces = None
     rows = []
     for app, filename, meta in selected:
         unit = meta['unit']
         info = unit_info(unit)
         path = QUAD / filename
-        sd = systemd_state(info)
-        if path.is_symlink() or (info['LoadState'] == 'loaded' and not same_path(info.get('SourcePath'), path)):
-            sd = 'conflict'
+        unit_conflict = path.is_symlink() or (
+            info['LoadState'] == 'loaded' and not same_path(info.get('SourcePath'), path))
         container = containers.get(meta['resource'])
-        cs = 'absent'
-        if container is not None:
-            labels = container.get('Labels') or {}
-            cs = (container.get('State') or 'unknown') if labels.get('PODMAN_SYSTEMD_UNIT') == unit else 'conflict'
-        rows.append((f'{app}/{Path(filename).stem}', sd, cs))
-    OUT.table(('PROJECT/SERVICE', 'SYSTEMD', 'CONTAINER'), rows,
-              {'active/running': '32', 'running': '32', 'inactive/dead': '2', 'absent': '2',
-               'failed/failed': '31', 'not-found': '33', 'conflict': '31'})
-    if any(sd.endswith('*') for _, sd, _ in rows):
+        labels = (container or {}).get('Labels') or {}
+        conflict = unit_conflict or (container is not None and labels.get('PODMAN_SYSTEMD_UNIT') != unit)
+        state = (container.get('State') or 'unknown') if container is not None else 'absent'
+        status = 'conflict' if conflict else list_service_state(info, state)
+        uptime, ports = '-', '-'
+        if not conflict and state in ('running', 'paused'):
+            started = container.get('StartedAt') or 0
+            if started > 0:
+                uptime = format_uptime(max(0, observed - started)).replace(' ', '')
+            if container.get('Ports'):
+                if interfaces is None:
+                    interfaces = host_interfaces()
+                ports = published_ports(container['Ports'], interfaces)
+        if info.get('NeedDaemonReload') == 'yes':
+            status += '*'
+        rows.append((list_service_name(app, Path(filename).stem), status, uptime, ports))
+    OUT.table(('SERVICE', 'STATUS', 'UPTIME', 'PORTS'), rows,
+              {'up': '32', 'down': '2', 'failed': '31', 'conflict': '31',
+               'missing': '33', 'no-ctr': '33', 'restart': '33', 'paused': '33'})
+    if any(status.endswith('*') for _, status, _, _ in rows):
         OUT.line('WARN', '* systemd reports daemon-reload needed')
     return 0
 

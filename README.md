@@ -290,7 +290,11 @@ appctl ps myapp                 # One project
 appctl ps myapp myapp-api       # One service
 ```
 
-The table shows `PROJECT/SERVICE`, `SYSTEMD`, and `CONTAINER`, sorted by project and service. Stopped and failed services remain visible. If Quadlet has removed a stopped service's container, its container state is `absent`.
+The table shows `SERVICE`, `STATUS`, `UPTIME`, and `PORTS`, sorted by project and service. A service name that already contains its project name is shown on its own. Other services use the `project/service` form.
+
+`STATUS` combines systemd and container state. Common values include `up`, `down`, `failed`, `paused`, and `restart`. `missing` means the systemd unit was not found. `no-ctr` means systemd reports the service active while its container is absent. `run-only` means the container is running while the systemd unit is inactive.
+
+`UPTIME` measures time since the current container started. `PORTS` shows its published host ports. For example, `all:8080` binds on all interfaces, `local:5432` binds on loopback, and `eth0:8443->443` forwards host port 8443 to port 443 in the container. TCP is implicit. Other protocols display a suffix such as `/udp`. A specific address is shown as `bound` if the interface cannot be resolved. A dash indicates unavailable uptime or no live published ports.
 
 ### Remove deployed services
 
