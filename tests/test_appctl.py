@@ -42,6 +42,7 @@ class DeployTests(unittest.TestCase):
         self.pulls = []
         self.calls = []
         self.preflight_sources = set()
+        self.preflight_dropins = {}
         self.preflight_invalid = set()
         self.live_invalid = set()
         self.cannot_start = set()
@@ -65,6 +66,8 @@ class DeployTests(unittest.TestCase):
             self.calls.append(('preflight',))
             staged = Path(env['QUADLET_UNIT_DIRS'].split(os.pathsep)[0])
             self.preflight_sources = {path.name for path in staged.iterdir()}
+            self.preflight_dropins = {str(path.relative_to(staged)): path.read_text()
+                                       for path in staged.glob('*.container.d/*.conf')}
             generated = []
             for path in staged.iterdir():
                 if path.name not in self.desired or path.name in self.preflight_invalid:
@@ -624,6 +627,122 @@ class DeployTests(unittest.TestCase):
         prefix.unlink()
         self.assertEqual(self.deploy(), 'success')
         self.assertEqual(self.deploy(), 'noop')
+
+    def project_dropin(self, filename, content, app='demo'):
+        source = self.apps / app / filename
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text(content)
+        return source
+
+    def test_project_dropins_sync_with_the_generated_service_name(self):
+        self.desired = {
+            'gitea.container': quadlet('ContainerName=gitea-runtime\n'),
+            'mysql.container': quadlet('ServiceName=mysql-db\n'),
+        }
+        gitea_name = 'gitea.container.d/10-service.conf'
+        mysql_name = 'mysql.container.d/10-service.conf'
+        gitea = self.project_dropin(gitea_name, '[Service]\nRestartSec=10\nTimeoutStartSec=300\n')
+        mysql = self.project_dropin(mysql_name,
+                                   '[Container]\nPodmanArgs=--memory=384m --memory-swap=384m\n'
+                                   '[Service]\nTimeoutStopSec=120\n')
+        local = self.quad / 'gitea.container.d/20-local.conf'
+        local.parent.mkdir()
+        local.write_text('[Service]\nMemoryHigh=400M\n')
+
+        self.assertEqual(self.deploy(), 'success')
+        self.assertEqual(self.preflight_dropins, {
+            gitea_name: gitea.read_text(), mysql_name: mysql.read_text(),
+            'gitea.container.d/20-local.conf': local.read_text(),
+        })
+        self.assertEqual(self.manifest()['dropins'], [gitea_name, mysql_name])
+        self.assertEqual((self.quad / gitea_name).read_bytes(), gitea.read_bytes())
+        self.assertEqual((self.quad / mysql_name).read_bytes(), mysql.read_bytes())
+        self.assertEqual(self.deploy(), 'noop')
+
+        self.calls.clear()
+        gitea.write_text('[Service]\nRestartSec=15\n')
+        self.assertEqual(self.deploy(), 'success')
+        self.assertEqual(self.calls, [('preflight',), ('daemon-reload',), ('restart', 'gitea.service')])
+        self.assertEqual((self.quad / gitea_name).read_bytes(), gitea.read_bytes())
+
+        (self.quad / gitea_name).write_text('[Service]\nRestartSec=30\n')
+        self.calls.clear()
+        self.assertEqual(self.deploy(), 'success')
+        self.assertEqual(self.calls, [('preflight',), ('daemon-reload',), ('restart', 'gitea.service')])
+        self.assertEqual((self.quad / gitea_name).read_bytes(), gitea.read_bytes())
+
+        mysql.unlink()
+        self.calls.clear()
+        self.assertEqual(self.deploy(), 'success')
+        self.assertEqual(self.calls, [('preflight',), ('daemon-reload',), ('restart', 'mysql-db.service')])
+        self.assertNotIn(mysql_name, self.preflight_dropins)
+        self.assertFalse((self.quad / mysql_name).exists())
+        self.assertEqual(self.manifest()['dropins'], [gitea_name])
+        self.assertTrue(local.is_file())
+        self.assertEqual(self.deploy(), 'noop')
+
+    def test_project_dropins_refuse_existing_unmanaged_file_and_unsafe_flags(self):
+        self.desired = {'web.container': quadlet()}
+        name = 'web.container.d/10-service.conf'
+        source = self.project_dropin(name, '[Container]\nPodmanArgs=--memory=384m --name=other\n')
+        with self.assertRaisesRegex(appctl.DeployError, 'Only --memory and --memory-swap'):
+            self.deploy()
+        self.assertEqual(self.calls, [])
+        source.write_text('[Service]\nRestartSec=10\n')
+        installed = self.quad / name
+        installed.parent.mkdir()
+        installed.write_bytes(source.read_bytes())
+        with self.assertRaisesRegex(appctl.DeployError, 'Unmanaged drop-in'):
+            self.deploy()
+        self.assertEqual(installed.read_bytes(), source.read_bytes())
+        self.assertFalse(self.manifest())
+        self.assertEqual(self.calls, [])
+
+    def test_project_dropins_restore_previous_files_after_live_validation_failure(self):
+        self.desired = {'web.container': quadlet()}
+        old_name = 'web.container.d/10-service.conf'
+        new_name = 'web.container.d/20-service.conf'
+        original = '[Service]\nRestartSec=10\n'
+        old_source = self.project_dropin(old_name, original)
+        self.deploy()
+        old_source.unlink()
+        new_source = self.project_dropin(new_name, '[Service]\nRestartSec=12\n')
+        self.live_invalid.add('web.container')
+        self.calls.clear()
+        with self.assertRaisesRegex(appctl.DeployError, 'Quadlet generation failed'):
+            self.deploy()
+        self.assertEqual(self.preflight_dropins, {new_name: new_source.read_text()})
+        self.assertEqual((self.quad / old_name).read_text(), original)
+        self.assertFalse((self.quad / new_name).exists())
+        self.assertEqual(self.calls, [('preflight',), ('daemon-reload',), ('daemon-reload',)])
+
+        self.live_invalid.clear()
+        self.assertEqual(self.deploy(), 'success')
+        self.assertEqual((self.quad / new_name).read_bytes(), new_source.read_bytes())
+        self.assertFalse((self.quad / old_name).exists())
+        self.assertEqual(self.deploy(), 'noop')
+
+    def test_removing_services_cleans_up_only_their_managed_dropins(self):
+        self.desired = {'old.container': quadlet(), 'web.container': quadlet()}
+        old_name = 'old.container.d/10-service.conf'
+        web_name = 'web.container.d/10-service.conf'
+        old_source = self.project_dropin(old_name, '[Service]\nRestartSec=10\n')
+        web_source = self.project_dropin(web_name, '[Service]\nRestartSec=12\n')
+        self.deploy()
+        local = self.quad / 'old.container.d/20-local.conf'
+        local.write_text('[Service]\nMemoryHigh=400M\n')
+
+        self.desired.pop('old.container')
+        self.assertEqual(self.deploy(), 'success')
+        self.assertFalse((self.quad / old_name).exists())
+        self.assertTrue(local.is_file())
+        self.assertTrue(old_source.is_file())
+        self.assertEqual(self.manifest()['dropins'], [web_name])
+
+        self.remove('web')
+        self.assertFalse((self.quad / web_name).exists())
+        self.assertTrue(web_source.is_file())
+        self.assertEqual(self.manifest()['dropins'], [])
 
 
 class RuntimeReadTests(unittest.TestCase):

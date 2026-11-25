@@ -287,11 +287,11 @@ def assert_runtime(meta, allowed):
         fail(f'Existing unmanaged {kind}: {name}')
     return None
 
-def parse(path):
+def parse(path, data=None):
     sections = {}
     group = None
     continued = []
-    for line in path.read_text().splitlines():
+    for line in (path.read_text() if data is None else data.decode()).splitlines():
         line = line.strip()
         if not line or line.startswith(('#',';')): continue
         if line.endswith('\\'):
@@ -347,17 +347,68 @@ def dropin_dirs(root, filename):
             *(root / (stem[:i + 1] + suffix + '.d') for i, c in enumerate(stem) if c == '-')]
 
 
-def dropins(path):
+def validate_dropin(path, data, *, managed=False):
+    sections = parse(path, data)
+    container = sections.get('Container', {})
+    service = sections.get('Service', {})
+    if (set(container) & {'ContainerName', 'ServiceName', 'Image', 'Pull', 'Volume', 'Mount',
+                         'EnvironmentFile', 'GlobalArgs', 'Pod'}
+            or set(sections) & {'Network', 'Volume'}
+            or set(service) & {'ExecStart', 'ExecStop', 'ExecStopPost', 'ExecStartPre'}
+            or 'Alias' in sections.get('Install', {})):
+        fail(f'Identity, mount or lifecycle override in drop-in: {path}; move it into Compose')
+    if managed and (set(sections) - {'Unit', 'Service', 'Install', 'Container'}
+                    or set(container) - {'PodmanArgs'}
+                    or any(key == 'Type' or key.startswith('Exec') for key in service)):
+        fail(f'Unsupported project drop-in setting: {path}')
+    for value in container.get('PodmanArgs', []):
+        flags = value.split()
+        if not flags or any(not re.fullmatch(r'--memory=[0-9]+[bkmgBKMG]?|'
+                                            r'--memory-swap=(?:-1|[0-9]+[bkmgBKMG]?)', flag)
+                            for flag in flags):
+            fail(f'Only --memory and --memory-swap size flags are supported in PodmanArgs: {path}')
+
+
+def dropins(path, projected=None):
     # Local global, prefix and exact Quadlet drop-ins. Fingerprints also include
     # local systemd service drop-ins. External admin drop-ins require --force.
     dirs = dropin_dirs(QUAD, path.name)
     dirs += dropin_dirs(CONFIG / 'systemd/user', metadata(path)['unit'])
-    paths = sorted({p for d in dirs for p in d.glob('*.conf')})
-    for p in paths:
-        section = parse(p)
-        if any(k in section.get('Container', {}) for k in ('ContainerName','ServiceName','Image','Pull','Volume','Mount','EnvironmentFile','PodmanArgs','GlobalArgs','Pod')) or 'Network' in section or 'Volume' in section or any(k in section.get('Service',{}) for k in ('ExecStart','ExecStop','ExecStopPost','ExecStartPre')) or 'Alias' in section.get('Install',{}):
-            fail(f'Identity, mount or lifecycle override in drop-in: {p}; move it into Compose')
-    return paths
+    projected = projected or {}
+    paths = {p for d in dirs for p in d.glob('*.conf')}
+    paths.update(p for p in projected if p.parent in dirs)
+    hashes = {}
+    for p in sorted(paths):
+        data = projected[p] if p in projected else p.read_bytes()
+        if data is not None:
+            validate_dropin(p, data)
+            hashes[str(p)] = hashlib.sha256(data).hexdigest()
+    return hashes
+
+
+def project_dropins(directory, containers):
+    wanted = {}
+    for filename in sorted(containers):
+        folder = directory / (filename + '.d')
+        if folder.is_symlink() or (folder.exists() and not folder.is_dir()):
+            fail(f'Invalid project drop-in directory: {folder}')
+        for source in sorted(folder.glob('*.conf')):
+            if Path(filename).stem.endswith('-'):
+                fail(f'Project drop-in directory would also match other services: {folder}')
+            if source.suffix != '.conf' or source.is_symlink() or not source.is_file():
+                fail(f'Invalid project drop-in file: {source}')
+            data = source.read_bytes()
+            validate_dropin(source, data, managed=True)
+            wanted[QUAD / folder.name / source.name] = data
+    return wanted
+
+
+def installed_dropin(path):
+    if path.parent.is_symlink() or (path.parent.exists() and not path.parent.is_dir()):
+        fail(f'Invalid installed drop-in directory: {path.parent}')
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        fail(f'Invalid installed drop-in file: {path}')
+    return path.read_bytes() if path.is_file() else None
 
 
 def mount_options(value):
@@ -417,9 +468,9 @@ def file_inputs(path):
             track(source)
     return result
 
-def fingerprint_inputs(path, image_id):
+def fingerprint_inputs(path, image_id, projected=None):
     return {'quadlet':digest(path), 'image_id':image_id, 'files':file_inputs(path),
-            'dropins':{str(p):digest(p) for p in dropins(path)}}
+            'dropins':dropins(path, projected)}
 
 def fingerprint(path, image_id):
     return hash_inputs(fingerprint_inputs(path,image_id))
@@ -458,6 +509,23 @@ def load_manifest(path):
             or not isinstance(manifest.get('named_volumes'), list)):
         fail(f'Invalid ownership manifest: {path}')
     return manifest
+
+
+def owned_project_dropins(manifest):
+    names = manifest.get('dropins', [])
+    if not isinstance(names, list):
+        fail('Invalid project drop-in ownership')
+    owned = set()
+    for name in names:
+        path = Path(name) if isinstance(name, str) else Path()
+        meta = manifest['files'].get(path.parent.stem, {})
+        if (len(path.parts) != 2 or str(path) != name or path.parent.suffix != '.d'
+                or meta.get('kind') != 'container' or not NAME.fullmatch(path.parent.stem)
+                or Path(path.parent.stem).stem.endswith('-')
+                or path.suffix != '.conf'):
+            fail(f'Invalid managed drop-in: {name}')
+        owned.add(QUAD / path)
+    return owned
 
 
 def volume_names(files):
@@ -577,14 +645,25 @@ def generator_command():
     fail('Podman Quadlet generator not found. Install Podman with systemd integration.')
 
 
-def preflight_generator(desired, desired_paths, stale):
+def preflight_generator(desired, desired_paths, stale, dropin_changes):
     with tempfile.TemporaryDirectory(prefix='appctl-quadlet-') as tmp:
         temp = Path(tmp)
         staged = temp / 'quadlets'
         staged.mkdir()
+        changed_dirs = {path.parent for path in dropin_changes}
         for entry in QUAD.iterdir():
-            if entry.name not in desired and entry.name not in stale:
+            if entry not in changed_dirs and entry.name not in desired and entry.name not in stale:
                 (staged / entry.name).symlink_to(entry.absolute())
+        for directory in changed_dirs:
+            staged_dir = staged / directory.name
+            staged_dir.mkdir()
+            if directory.is_dir():
+                for path in directory.iterdir():
+                    if path not in dropin_changes:
+                        (staged_dir / path.name).symlink_to(path.absolute())
+        for path, data in dropin_changes.items():
+            if data is not None:
+                (staged / path.relative_to(QUAD)).write_bytes(data)
         for filename, path in desired_paths.items():
             shutil.copyfile(path, staged / filename)
         shared = temp / 'admin'
@@ -627,14 +706,18 @@ def reload_units():
     system('daemon-reload', capture=False)
 
 
-def install_quadlets(desired, desired_paths, changed, stale, reload_needed, event):
+def install_quadlets(desired, changes, stale, reload_needed, event):
     previous = {}
     try:
-        for filename in changed:
-            path = QUAD / filename
+        for path, data in changes.items():
             previous[path] = path.read_bytes() if path.is_file() else None
-            atomic(path, desired_paths[filename].read_bytes())
-            event('installed', file=filename)
+            filename = str(path.relative_to(QUAD))
+            if data is None:
+                path.unlink(missing_ok=True)
+                event('dropin_removed', file=filename)
+            else:
+                atomic(path, data)
+                event('installed', file=filename)
         if reload_needed: reload_units()
         else: OUT.line('SKIP', 'systemd daemon-reload not required')
         units = loaded_units(desired)
@@ -786,9 +869,23 @@ def deploy(args, project, event):
         desired={f:metadata(p) for f,p in desired_paths.items()}
         containers={f:m for f,m in desired.items() if m['kind']=='container'}
         if not containers: fail('No container units generated; empty project not supported')
+        stale = {f: m for f, m in owned.items() if f not in desired and m['kind'] == 'container'}
         requested_volumes = {name for f in containers
                              for name in named_volumes(parse(desired_paths[f])['Container'])}
         claims = check_collisions(app, desired, manifest, requested_volumes)
+        wanted_dropins = project_dropins(compose.parent, containers)
+        owned_dropins = owned_project_dropins(manifest)
+        stale_dropins = {path for path in owned_dropins if path.parent.stem in stale}
+        dropin_changes = {}
+        for path in sorted(owned_dropins | wanted_dropins.keys()):
+            current = installed_dropin(path)
+            if current is not None and path not in owned_dropins:
+                fail(f'Unmanaged drop-in: {path}; move it aside before deploying')
+            data = wanted_dropins.get(path)
+            if path not in stale_dropins and data != current:
+                dropin_changes[path] = data
+        dropin_updates = {path.parent.stem for path in dropin_changes}
+        wanted_names = sorted(str(path.relative_to(QUAD)) for path in wanted_dropins)
         # Retain resource definitions and ownership even if removed from Compose.
         for f,m in desired.items():
             dest=QUAD/f
@@ -810,7 +907,7 @@ def deploy(args, project, event):
                 else: event('image_cached',image=image)
                 images[image]=run('podman','image','inspect','--format','{{.Id}}',image).stdout.strip()
                 if not images[image]: fail('Empty image ID')
-            image_id=images[image]; inputs=fingerprint_inputs(p,image_id); fp=hash_inputs(inputs)
+            image_id=images[image]; inputs=fingerprint_inputs(p,image_id,dropin_changes); fp=hash_inputs(inputs)
             obj=inspect_container(m['resource']); info=unit_info(m['unit'])
             running = info.get('ActiveState') == 'active' and running_image(obj, image_id)
             prev=state.get(f,{})
@@ -833,6 +930,8 @@ def deploy(args, project, event):
                         if key=='dropins': reload_needed=True
                 if not reasons: reasons.append('deployment fingerprint changed')
             if prev and not same and 'Quadlet changed' not in reasons: reasons.append('Quadlet differs')
+            if f in dropin_updates and 'drop-in changed' not in reasons:
+                reasons.append('drop-in differs')
             if (prev or same) and not running: reasons.append('not running expected image')
             if info.get('NeedDaemonReload')=='yes':
                 reasons.append('systemd reload pending'); reload_needed=True
@@ -840,23 +939,31 @@ def deploy(args, project, event):
             plans[f]={'fingerprint':fp,'inputs':inputs,'image':image,'image_id':image_id,'update':update}
             event('plan_update' if update else 'skip',unit=m['unit'],image=image,image_id=image_id,
                   reason=', '.join(reasons) if update else 'unchanged',paths=details)
-        stale={f:m for f,m in owned.items() if f not in desired and m['kind']=='container'}
-        changed=[f for f,p in desired_paths.items() if not (QUAD/f).is_file() or (QUAD/f).read_bytes()!=p.read_bytes()]
+        changes = dict(dropin_changes)
+        for filename, source in desired_paths.items():
+            dest = QUAD / filename
+            data = source.read_bytes()
+            if not dest.is_file() or dest.read_bytes() != data:
+                changes[dest] = data
         pending=manifest.get('reload_pending',False)
-        reload_needed=bool(reload_needed or changed or pending)
+        reload_needed=bool(reload_needed or changes or pending)
         updates={f for f in plans if plans[f]['update']}
         for f,m in stale.items(): OUT.line('PLAN',m['unit'],'removed from Compose')
         OUT.line('INFO',f'{len(updates)} to update, {len(plans)-len(updates)} unchanged, {len(stale)} to remove')
         if not (reload_needed or stale or updates):
+            if owned_dropins != wanted_dropins.keys():
+                manifest['dropins'] = wanted_names
+                save(mp, manifest)
             return 'noop'
         if reload_needed or stale:
-            preflight_generator(desired, desired_paths, stale)
+            preflight_generator(desired, desired_paths, stale, dropin_changes)
         OUT.phase('[3/4] Apply changes')
         # Reserve names and persist a reload marker BEFORE modifying anything.
         manifest = {**manifest, 'files': {**owned, **desired}, 'named_volumes': sorted(claims),
+                    'dropins': sorted(str(path.relative_to(QUAD)) for path in owned_dropins | wanted_dropins.keys()),
                     'reload_pending': bool(reload_needed or stale)}
         save(mp,manifest)
-        container_units, order = install_quadlets(desired, desired_paths, changed, stale, reload_needed, event)
+        container_units, order = install_quadlets(desired, changes, stale, reload_needed, event)
         # The replacement units are loaded. Old definitions stay available until
         # the replacement is running, even when it needs to reuse a released port.
         for f in updates: invalidate_service(state, f)
@@ -869,6 +976,9 @@ def deploy(args, project, event):
         verify_services(containers, plans)
         if stale:
             for f in stale: (QUAD/f).unlink(missing_ok=True)
+            for path in sorted(stale_dropins):
+                path.unlink(missing_ok=True)
+                event('dropin_removed', file=str(path.relative_to(QUAD)))
             reload_units()
             loaded_units(desired)
             for f, m in stale.items():
@@ -887,6 +997,7 @@ def deploy(args, project, event):
             event('restarted' if action=='restart' else 'started',unit=m['unit'],image=plan['image'],image_id=plan['image_id'])
         # State contains only desired, successfully deployed services.
         state={f:v for f,v in state.items() if f in containers}; save(sp,state)
+        manifest['dropins'] = wanted_names
         manifest['reload_pending'] = False
         manifest['deployed_at'] = now()
         save(mp, manifest)
@@ -1418,6 +1529,10 @@ def remove_deployment(args, project, event):
     targets = {**selected, **{resource_files[key]: files[resource_files[key]]
                               for key in resources if key in resource_files}}
     check_removal_ownership(args.app, targets, resources)
+    owned_dropins = owned_project_dropins(manifest)
+    removed_dropins = {path for path in owned_dropins if path.parent.stem in selected}
+    for path in removed_dropins:
+        installed_dropin(path)
     for filename, meta in targets.items():
         removal_unit(filename, meta)
     owners = {}
@@ -1441,6 +1556,9 @@ def remove_deployment(args, project, event):
             run('podman', 'container', 'rm', '--', require_container_id(container, name), capture=False)
     for filename in selected:
         (QUAD / filename).unlink(missing_ok=True)
+    for path in sorted(removed_dropins):
+        path.unlink(missing_ok=True)
+        event('dropin_removed', file=str(path.relative_to(QUAD)))
     if selected:
         reload_units()
         for unit in removed_units:
@@ -1480,6 +1598,7 @@ def remove_deployment(args, project, event):
         save(state_path, {filename: data for filename, data in state.items() if filename not in selected})
     for filename in removed_files:
         files.pop(filename)
+    manifest['dropins'] = sorted(str(path.relative_to(QUAD)) for path in owned_dropins - removed_dropins)
     manifest['named_volumes'] = [name for name in manifest['named_volumes']
                                  if ('volume', name) not in removed_resources]
     manifest.pop('remove_pending')
@@ -1626,6 +1745,7 @@ def main(argv=None):
                 if fields.get('paths'): detail=(detail or '')+' | '+', '.join(fields['paths'])
                 OUT.line('PLAN' if action=='plan_update' else 'SKIP',unit,detail)
             elif action=='installed': OUT.line('INSTALL',fields['file'])
+            elif action=='dropin_removed': OUT.line('REMOVE',fields['file'])
             elif action.endswith('_begin'): OUT.line(action.split('_')[0].upper(),unit)
             elif action in ('resource_kept', 'resource_removed'):
                 label = 'KEEP' if action == 'resource_kept' else 'OK'

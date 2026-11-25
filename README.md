@@ -14,6 +14,7 @@ Designed for self-hosted applications, single-server deployments, and CI/CD work
 
 - **Compose as the deployment source** — generate `.container`, `.network`, and `.volume` files automatically with Podlet.
 - **Incremental deployment** — compare image IDs, generated Quadlet definitions, referenced configuration files, and supported local drop-ins; restart only affected services.
+- **Project-managed Quadlet drop-ins** — deploy service-specific systemd settings from directories next to `compose.yml`.
 - **Local image caching** — reuse existing versioned images; explicitly refresh remote images with `--pull`.
 - **Application lifecycle management** — start, stop, restart, and check the runtime state of a project or one service.
 - **Compose resource inspection** — list published ports, exposed ports, volumes, and file mounts before deployment.
@@ -386,7 +387,7 @@ A service's deployment fingerprint includes:
 
 - The generated Quadlet file content and resolved local image ID.
 - SHA-256 hashes of regular files mounted using supported `Volume=` or bind `Mount=` definitions, and files referenced by `EnvironmentFile=`.
-- Supported local Quadlet and systemd drop-in configuration files, including service-name prefixes under `$XDG_CONFIG_HOME/systemd/user` (default: `~/.config/systemd/user`).
+- Project-managed and supported local Quadlet and systemd drop-in files, including service-name prefixes under `$XDG_CONFIG_HOME/systemd/user` (default: `~/.config/systemd/user`).
 
 Configuration file names are not restricted to `.app.toml` or `.env`. Files such as `.appprod.toml`, `settings.json`, and `config.yaml` are tracked when explicitly referenced. Missing required bind sources cause deployment to fail during preflight. Directory contents are deliberately not hashed recursively, so uploaded files, model files, and other persistent data do not trigger deployments.
 
@@ -395,6 +396,30 @@ Configuration changes are detected **when `appctl deploy` runs**; appctl is not 
 Use `pull_policy: never` explicitly in each Compose service. appctl resolves images before starting services and prevents implicit registry pulls during systemd startup. Prefer versioned image references; if a mutable tag has been updated, use `--pull` to refresh it.
 
 When definitions change, appctl checks the candidate Quadlets with the Podman generator in a temporary directory. It verifies that systemd loads the expected units before stopping removed services. Updates follow the loaded systemd dependency order, and deployment success requires all desired services to be active with the expected images.
+
+### Project-managed Quadlet drop-ins
+
+Place each service's `<service>.container.d/` directory alongside `compose.yml`. Match the generated `.container` filename, which normally comes from the Compose service key. For example, service `mysql` uses `mysql.container.d/` even if Compose sets a different `container_name`.
+
+```text
+/var/www/gitea-server/
+├── compose.yml
+├── gitea.container.d/
+│   └── 10-service.conf
+└── mysql.container.d/
+    └── 10-service.conf
+```
+
+```ini
+[Service]
+RestartSec=10
+TimeoutStartSec=300
+TimeoutStopSec=60
+```
+
+Run `appctl deploy gitea-server` to validate and install these `.conf` files under `$XDG_CONFIG_HOME/containers/systemd` (default: `~/.config/containers/systemd`). Use `[Unit]`, `[Service]`, and `[Install]` for systemd settings. Keep service identity, mounts, and commands in Compose. In a project drop-in, `[Container]` also supports `PodmanArgs=--memory=384m --memory-swap=384m` for container memory limits.
+
+Adding, editing, or deleting a managed drop-in triggers a systemd user-manager reload and updates the affected service. Only files for generated container units are imported. When a deployed service is removed, appctl also removes its managed copies. Local drop-ins are kept. If one already occupies the same destination filename, move it aside before the first managed deploy.
 
 ### Lifecycle semantics
 
@@ -420,7 +445,7 @@ By design, appctl rejects unmanaged Quadlets or runtime objects with conflicting
 ~/.local/state/appctl/         # or $XDG_STATE_HOME/appctl
 ├── deploy.lock
 └── demo/
-    ├── manifest.json          # owned resources and project deployment time
+    ├── manifest.json          # owned resources, project drop-ins and deployment time
     ├── state.json             # last successful deployment state per service
     └── history/               # structured operation records
         └── <timestamp>-<id>.json
@@ -474,7 +499,7 @@ appctl focuses on ordinary long-running, image-based services in a single rootle
 
 - HTTP or application-level readiness checks, automatic rollback of running services, or blue/green deployments. appctl restores changed Quadlet files if live unit validation fails. Deployment verification checks systemd and the expected running container image.
 - Multi-host scheduling, high availability, load balancing, or image building.
-- Arbitrary Compose/Quadlet features, including pods, build/image units, oneshot/template units, custom aliases, dynamic resource specifiers, or raw `PodmanArgs`/`GlobalArgs`.
+- Arbitrary Compose/Quadlet features, including pods, build/image units, oneshot/template units, custom aliases, dynamic resource specifiers, unrestricted `PodmanArgs`, or `GlobalArgs`.
 - Recursive configuration-directory hashing, secret-value change tracking, comprehensive host-port conflict auditing, or full detection of external runtime changes.
 - Automatic adoption of existing services, persistent enable/disable commands, or automatic image cleanup.
 
