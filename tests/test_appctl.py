@@ -1,3 +1,4 @@
+import json
 import os
 import signal
 import tempfile
@@ -759,6 +760,87 @@ class RuntimeReadTests(unittest.TestCase):
             'named_volumes': [],
             'reload_pending': False,
         })
+
+    def list_services(self, args, containers, units, *, root=None):
+        root = self.root if root is None else root
+        with patch.object(appctl, 'ROOT', root), patch.object(appctl, 'QUAD', root / 'quadlet'), \
+                patch.object(appctl, 'OUT', appctl.Output()), patch.object(appctl, 'configure'), \
+                patch.object(appctl.shutil, 'which', side_effect=lambda name: name), \
+                patch.object(appctl, 'run', return_value=SimpleNamespace(stdout=json.dumps(containers))) as run, \
+                patch.object(appctl, 'unit_info', side_effect=units.__getitem__) as unit_info, \
+                redirect_stdout(StringIO()) as stdout:
+            self.assertEqual(appctl.main([*args, '--no-color']), 0)
+        self.assertFalse((root / 'deploy.lock').exists())
+        self.assertEqual(list(root.glob('*/history/*')), [])
+        if units:
+            run.assert_called_once_with('podman', 'ps', '--all', '--format', 'json')
+        else:
+            run.assert_not_called()
+        return stdout.getvalue(), [call.args[0] for call in unit_info.call_args_list]
+
+    def test_list_reports_all_managed_services_including_stopped_and_failed(self):
+        appctl.save(self.root / 'alpha/manifest.json', {
+            'files': {
+                'web.container': {'kind': 'container', 'unit': 'web.service', 'resource': 'web-runtime'},
+            },
+            'named_volumes': [],
+        })
+        containers = [
+            {'Names': ['web-runtime'], 'Labels': {'PODMAN_SYSTEMD_UNIT': 'web.service'}, 'State': 'exited'},
+            {'Names': ['api-container'], 'Labels': {'PODMAN_SYSTEMD_UNIT': 'api-custom.service'}, 'State': 'running',
+             'Id': 'hidden-id', 'Image': 'hidden-image', 'Command': ['hidden-command']},
+            {'Names': ['unmanaged'], 'Labels': None, 'State': 'running'},
+        ]
+        units = {
+            'web.service': {'LoadState': 'loaded', 'SourcePath': str(self.root / 'quadlet/web.container'),
+                            'ActiveState': 'failed', 'SubState': 'failed'},
+            'api-custom.service': {'LoadState': 'loaded', 'SourcePath': str(self.root / 'quadlet/api.container'),
+                                   'ActiveState': 'active', 'SubState': 'running'},
+            'worker.service': {'LoadState': 'loaded', 'SourcePath': str(self.root / 'quadlet/worker.container'),
+                               'ActiveState': 'inactive', 'SubState': 'dead'},
+        }
+
+        report, queried = self.list_services(['list'], containers, units)
+
+        self.assertEqual(queried, ['web.service', 'api-custom.service', 'worker.service'])
+        self.assertEqual([line.split() for line in report.splitlines() if '/' in line], [
+            ['PROJECT/SERVICE', 'SYSTEMD', 'CONTAINER'],
+            ['alpha/web', 'failed/failed', 'exited'],
+            ['demo/api', 'active/running', 'running'],
+            ['demo/worker', 'inactive/dead', 'absent'],
+        ])
+        for value in ('hidden-id', 'hidden-image', 'hidden-command', 'unmanaged', 'cache.volume'):
+            self.assertNotIn(value, report)
+
+    def test_list_and_ps_support_project_and_service_filters(self):
+        units = {
+            'api-custom.service': {'LoadState': 'not-found'},
+            'worker.service': {'LoadState': 'not-found'},
+        }
+        report, queried = self.list_services(['list', 'demo'], [], units)
+        self.assertEqual(queried, ['api-custom.service', 'worker.service'])
+        self.assertRegex(report, r'demo/worker\s+not-found\s+absent')
+        report, queried = self.list_services(['ps', 'demo', 'api'], [], units)
+        self.assertEqual(queried, ['api-custom.service'])
+        self.assertRegex(report, r'demo/api\s+not-found\s+absent')
+        self.assertNotIn('demo/worker', report)
+        self.assertEqual(self.list_services(['list', 'demo', 'api'], [], units)[0], report)
+
+    def test_list_checks_container_and_unit_ownership(self):
+        containers = [{'Names': ['api-container'], 'Labels': None, 'State': 'running'}]
+        units = {
+            'api-custom.service': {'LoadState': 'loaded', 'SourcePath': str(self.root / 'foreign.container'),
+                                   'ActiveState': 'active', 'SubState': 'running'},
+        }
+        report, _ = self.list_services(['ps', 'demo', 'api'], containers, units)
+        self.assertRegex(report, r'demo/api\s+conflict\s+conflict')
+
+    def test_list_with_no_state_does_not_create_it(self):
+        missing = self.root / 'missing'
+        report, queried = self.list_services(['ps'], [], {}, root=missing)
+        self.assertIn('No deployed services', report)
+        self.assertEqual(queried, [])
+        self.assertFalse(missing.exists())
 
     def logs(self, *args, source=None, child_status=0, podman_available=False):
         source_args = ['--source', source] if source else []

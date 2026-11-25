@@ -5,6 +5,7 @@
 #   appctl deploy APP [--pull] [--force]
 #   appctl {start,stop,restart,status} APP [SERVICE]
 #   appctl remove APP [SERVICE] [--volumes] [--networks]
+#   appctl {list,ps} [APP [SERVICE]]
 #   appctl stats APP [SERVICE] [--no-stream] [--interval SECONDS | --processes]
 #   appctl inspect APP [SERVICE]
 #   appctl logs APP [SERVICE] [-n N] [-f] [--since TIME] [--source journald|podman]
@@ -43,12 +44,13 @@
 #   * start/restart use installed unit definitions, not pending Compose changes;
 #     may read current bind files. Last successful deploy fingerprint is retained.
 #     status displays systemd state and actual container state; does not deploy.
+#   * list (ps) shows deployed services and their runtime states across projects.
 #   * stats shows Podman resource usage or a snapshot of container processes.
 #   * inspect lists ports and mounts from the current Compose file.
 #   * logs reads deployed containers' stdout and stderr from journald or Podman.
 #   * remove uninstalls deployed services, with opt-in named volume and network cleanup.
 #   * JSON history for deploy/start/stop/restart/remove, including failure and no-op;
-#     read-only status/history calls are not logged. No config values in history.
+#     read-only calls are not logged. No config values in history.
 #     Retain 90 days AND at most 100 attempts/project (constants below).
 #     GC runs on every mutating deployment/control, across all projects.
 #   * State: $XDG_STATE_HOME/appctl (default ~/.local/state/appctl).
@@ -532,7 +534,9 @@ def volume_names(files):
     return {meta['resource'] for meta in files.values() if meta['kind'] == 'volume'}
 
 
-def project_manifests(app):
+def project_manifests(app=None):
+    if not ROOT.exists():
+        return
     for project in ROOT.iterdir():
         path = project / 'manifest.json'
         if project.name != app and path.is_file():
@@ -1009,6 +1013,16 @@ def container_services(manifest):
             if meta['kind'] == 'container'}
 
 
+def select_container_service(services, app, service):
+    if not service:
+        return services
+    filename = service + '.container'
+    if filename not in services:
+        fail(f'Unknown service {service} in {app}; available: ' +
+             (', '.join(Path(f).stem for f in sorted(services)) or '(none)'))
+    return {filename: services[filename]}
+
+
 def managed_services(args, project):
     mp = project/'manifest.json'
     if not mp.is_file():
@@ -1018,13 +1032,7 @@ def managed_services(args, project):
         fail(removal_retry(args.app, manifest['remove_pending']))
     if manifest.get('reload_pending') and args.command in ('start','restart'):
         fail('Previous deployment incomplete; run appctl deploy first')
-    selected = container_services(manifest)
-    if args.service:
-        name = args.service + '.container'
-        if name not in selected:
-            fail(f'Unknown service {args.service} in {args.app}; available: '+
-                 ', '.join(Path(f).stem for f in sorted(selected)))
-        selected = {name:selected[name]}
+    selected = select_container_service(container_services(manifest), args.app, args.service)
     if not selected:
         fail(f'No managed container services in {args.app}')
     return manifest, dict(sorted(selected.items()))
@@ -1167,6 +1175,57 @@ def show_deployment_times(app, project_times, service_times, filenames=(), *, st
         OUT.table(('SERVICE', 'DEPLOYED (UTC)', 'UPTIME'), rows, stream=stream)
 
 
+def systemd_state(info):
+    load_state = info.get('LoadState', 'unknown')
+    state = (info.get('ActiveState', 'unknown') + '/' + info.get('SubState', 'unknown')
+             if load_state == 'loaded' else load_state)
+    return state + ('*' if info.get('NeedDaemonReload') == 'yes' else '')
+
+
+def show_service_list(args):
+    if args.app:
+        manifest = ROOT / args.app / 'manifest.json'
+        if not manifest.is_file():
+            fail(f'Project not managed: {args.app}; run appctl deploy first')
+        projects = [(args.app, load_manifest(manifest))]
+    else:
+        projects = sorted(project_manifests())
+    selected = []
+    for app, manifest in projects:
+        services = select_container_service(container_services(manifest), app, args.service)
+        selected.extend((app, filename, services[filename])
+                        for filename in sorted(services, key=lambda name: Path(name).stem))
+
+    OUT.header('list', args.app, args.service)
+    if not selected:
+        OUT.line('INFO', 'No deployed services')
+        return 0
+
+    # Take one Podman snapshot and match names and ownership labels from the manifest.
+    snapshot = json.loads(run('podman', 'ps', '--all', '--format', 'json').stdout)
+    containers = {item['Names'][0]: item for item in snapshot if item.get('Names')}
+    rows = []
+    for app, filename, meta in selected:
+        unit = meta['unit']
+        info = unit_info(unit)
+        path = QUAD / filename
+        sd = systemd_state(info)
+        if path.is_symlink() or (info['LoadState'] == 'loaded' and not same_path(info.get('SourcePath'), path)):
+            sd = 'conflict'
+        container = containers.get(meta['resource'])
+        cs = 'absent'
+        if container is not None:
+            labels = container.get('Labels') or {}
+            cs = (container.get('State') or 'unknown') if labels.get('PODMAN_SYSTEMD_UNIT') == unit else 'conflict'
+        rows.append((f'{app}/{Path(filename).stem}', sd, cs))
+    OUT.table(('PROJECT/SERVICE', 'SYSTEMD', 'CONTAINER'), rows,
+              {'active/running': '32', 'running': '32', 'inactive/dead': '2', 'absent': '2',
+               'failed/failed': '31', 'not-found': '33', 'conflict': '31'})
+    if any(sd.endswith('*') for _, sd, _ in rows):
+        OUT.line('WARN', '* systemd reports daemon-reload needed')
+    return 0
+
+
 def show_status(args, project):
     runtime = {}
     selected = selected_units(args, project, runtime)
@@ -1177,9 +1236,7 @@ def show_status(args, project):
     rows = []
     for f in selected:
         info, obj = runtime[f]
-        sd = info.get('ActiveState','unknown')+'/'+info.get('SubState','unknown')
-        if info.get('LoadState') != 'loaded': sd = info.get('LoadState','unknown')
-        if info.get('NeedDaemonReload')=='yes': sd += '*'
+        sd = systemd_state(info)
         state = (obj or {}).get('State',{})
         cs = ('running' if state.get('Running') else state.get('Status','stopped')) if obj else 'absent'
         iid = (obj or {}).get('Image','').removeprefix('sha256:')[:12] or '-'
@@ -1629,6 +1686,10 @@ def parse_args(argv=None):
     p.add_argument('app',help=f'Project directory under APPCTL_BASE_DIR (default: {DEFAULT_BASE_DIR})')
     p.add_argument('--pull',action='store_true',help='Check registry even for cached images')
     p.add_argument('--force',action='store_true',help='Restart all desired services')
+    p = subs.add_parser('list', aliases=['ps'], help='List deployed services and their runtime states')
+    p.set_defaults(command='list')
+    p.add_argument('app', nargs='?', help='Project name (default: all deployed projects)')
+    p.add_argument('service', nargs='?', help='Compose service name (default: all deployed services in the project)')
     for action, helptext in [
         ('start', 'Start deployed services'),
         ('stop', 'Temporarily stop deployed services'),
@@ -1662,7 +1723,7 @@ def parse_args(argv=None):
     p.add_argument('app')
     p.add_argument('--limit',type=int,default=20,help='Maximum entries to list (default: 20)')
     subs.add_parser('gc',help='Prune expired/excess history across all projects')
-    for sub in subs.choices.values(): output_flags(sub,argparse.SUPPRESS)
+    for sub in dict.fromkeys(subs.choices.values()): output_flags(sub,argparse.SUPPRESS)
     args=parser.parse_args(argv)
     if getattr(args,'limit',1)<1: parser.error('--limit must be positive')
     if args.command == 'logs' and args.lines < 0:
@@ -1682,7 +1743,7 @@ def main(argv=None):
     configure()
     if OUT.verbose:
         OUT.line('INFO', f'User: {DEPLOY_USER} | Base: {BASE} | Podman target: {PODMAN_VERSION}')
-    required = ['podman', 'systemctl'] if args.command in ('deploy', 'start', 'stop', 'restart', 'remove', 'status') else []
+    required = ['podman', 'systemctl'] if args.command in ('deploy', 'start', 'stop', 'restart', 'remove', 'status', 'list') else []
     if args.command in ('deploy', 'inspect'):
         required.append('podlet')
     if args.command == 'logs':
@@ -1697,6 +1758,8 @@ def main(argv=None):
         return show_logs(args, ROOT / args.app)
     if args.command == 'stats':
         return show_stats(args, ROOT / args.app)
+    if args.command == 'list':
+        return show_service_list(args)
     os.umask(0o077); ROOT.mkdir(parents=True,exist_ok=True)
     os.environ.setdefault('REGISTRY_AUTH_FILE',str(HOME/'.config/containers/auth.json'))
     if args.command not in ('status','history'):

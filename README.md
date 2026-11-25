@@ -239,6 +239,8 @@ appctl start APP [SERVICE]
 appctl stop APP [SERVICE]
 appctl restart APP [SERVICE]
 appctl remove APP [SERVICE] [--volumes] [--networks]
+appctl list [APP [SERVICE]]
+appctl ps [APP [SERVICE]]
 appctl status APP [SERVICE]
 appctl stats APP [SERVICE] [--no-stream] [--interval SECONDS | --processes]
 appctl inspect APP [SERVICE]
@@ -258,6 +260,7 @@ appctl --version
 | `stop` | Temporarily stop already-deployed services without deleting deployment definitions or application data. |
 | `restart` | Restart already-deployed services using installed definitions. |
 | `remove` | Stop and uninstall deployed services. Keep named volumes and networks by default. |
+| `list`, `ps` | List deployed services and their runtime states across all projects or for the selected project or service. |
 | `status` | Show systemd and container state, images, deployment times, and uptime. |
 | `stats` | Stream Podman resource usage or list individual processes for deployed containers. |
 | `inspect` | Show ports and mounts declared in the current Compose file for a project or one service. |
@@ -278,6 +281,16 @@ appctl stats myapp --no-stream
 appctl history myapp --limit 50
 appctl gc
 ```
+
+### List deployed services
+
+```bash
+appctl list                     # All projects
+appctl ps myapp                 # One project
+appctl ps myapp myapp-api       # One service
+```
+
+The table shows `PROJECT/SERVICE`, `SYSTEMD`, and `CONTAINER`, sorted by project and service. Stopped and failed services remain visible. If Quadlet has removed a stopped service's container, its container state is `absent`.
 
 ### Remove deployed services
 
@@ -451,7 +464,7 @@ By design, appctl rejects unmanaged Quadlets or runtime objects with conflicting
         └── <timestamp>-<id>.json
 ```
 
-Deploy, start, stop, restart, and remove operations record successes, failures, and no-op results. `status` and `history` are read-only operations and are not recorded as history entries. An interrupted operation may leave a `running` history entry. Records include event details and image identities where available; configuration values are not intentionally recorded. Keep credentials out of image references and review diagnostic output before sharing it.
+Deploy, start, stop, restart, and remove operations record successes, failures, and no-op results. Read-only operations such as `list`, `status`, and `history` do not create history entries. An interrupted operation may leave a `running` history entry. Records include event details and image identities where available; configuration values are not intentionally recorded. Keep credentials out of image references and review diagnostic output before sharing it.
 
 History is automatically pruned on mutating operations across all projects. Defaults are **90 days and at most 100 records per project**. Change `DAYS` and `MAX_HISTORY` in the script to adjust retention. `appctl gc` also removes expired abandoned state-write temporary files. Current ownership manifests and active deployment state are not age-pruned.
 
