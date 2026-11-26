@@ -162,7 +162,7 @@ class DeployTests(unittest.TestCase):
             elif action == 'start' and (unit not in self.running or unit in self.jobs):
                 self.start(unit)
 
-    def deploy(self, app='demo', force=False, pull=False):
+    def deploy(self, app='demo', force=False, pull=False, env_file=None):
         appdir = self.apps / app
         appdir.mkdir(exist_ok=True)
         (appdir / 'compose.yml').touch()
@@ -171,7 +171,8 @@ class DeployTests(unittest.TestCase):
         self.old_files = {name for previous in self.state.iterdir()
                           for name in self.manifest(previous.name).get('files', {})}
         with redirect_stdout(StringIO()):
-            return appctl.deploy(SimpleNamespace(app=app, force=force, pull=pull), project,
+            args = SimpleNamespace(app=app, force=force, pull=pull, env_file=env_file)
+            return appctl.deploy(args, project,
                                  lambda action, **fields: None)
 
     def manifest(self, app='demo'):
@@ -335,6 +336,70 @@ class DeployTests(unittest.TestCase):
         self.assertEqual(self.pulls, [pull, pull])
         self.assertEqual(self.calls, [])
 
+    def test_deploy_reads_compose_env_and_restarts_when_rendered_values_change(self):
+        project = self.apps / 'demo'
+        project.mkdir()
+        compose = project / 'compose.yml'
+        template = json.dumps({'services': {'web': {
+            'image': 'docker.io/library/nginx:${IMAGE_TAG}',
+            'pull_policy': 'never',
+            'ports': ['${BIND_IP}:8080:80'],
+            'command': ['echo', '$${AT_RUNTIME}'],
+        }}})
+        compose.write_text(template)
+        env_file = project / 'compose.env'
+        env_file.write_text('# deployment variables\nBIND_IP=127.0.0.1 # loopback\nIMAGE_TAG="1.0.0"\n')
+
+        def convert(*cmd, **kwargs):
+            if cmd[0] == 'podlet':
+                self.assertEqual(cmd[-1], '-')
+                self.assertEqual(cmd[cmd.index('--absolute-host-paths') + 1], str(project))
+                service = json.loads(kwargs['input_text'])['services']['web']
+                self.assertEqual(service['command'], ['echo', '${AT_RUNTIME}'])
+                self.desired = {'web.container': '[Container]\n'
+                                f'Image={service["image"]}\nPull=never\n'
+                                f'PublishPort={service["ports"][0]}\n'}
+            return self.run_command(*cmd, **kwargs)
+
+        with patch.object(appctl, 'run', side_effect=convert), patch.dict(os.environ, {'IMAGE_TAG': 'unrelated'}):
+            self.assertEqual(self.deploy(), 'success')
+            live = self.quad / 'web.container'
+            self.assertIn('Image=docker.io/library/nginx:1.0.0', live.read_text())
+            self.assertIn('PublishPort=127.0.0.1:8080:80', live.read_text())
+
+            env_file.write_text("BIND_IP='0.0.0.0'\nIMAGE_TAG=2.0.0\n")
+            self.calls.clear()
+            self.assertEqual(self.deploy(), 'success')
+            self.assertIn(('restart', 'web.service'), self.calls)
+            self.assertIn('Image=docker.io/library/nginx:2.0.0', live.read_text())
+            self.assertIn('PublishPort=0.0.0.0:8080:80', live.read_text())
+
+            with env_file.open('a') as stream:
+                stream.write('UNUSED=value\n')
+            self.assertEqual(self.deploy(), 'noop')
+        self.assertEqual(compose.read_text(), template)
+
+    def test_compose_env_selection_errors_before_podlet(self):
+        project = self.apps / 'demo'
+        project.mkdir()
+        compose = project / 'compose.yml'
+        compose.write_text('image: repo:${IMAGE_TAG}\n')
+        default = project / 'compose.env'
+        default.write_text('IMAGE_TAG=stable\n')
+        override = self.base / 'production.env'
+        with patch.object(appctl, 'run') as run:
+            with self.assertRaisesRegex(appctl.DeployError, 'environment file not found'):
+                self.deploy(env_file=override)
+            override.write_text('OTHER=stable\n')
+            with self.assertRaisesRegex(appctl.DeployError, 'IMAGE_TAG is missing from'):
+                self.deploy(env_file=override)
+            override.write_text('IMAGE_TAG="unterminated\n')
+            with self.assertRaisesRegex(appctl.DeployError, 'Invalid quoted environment value'):
+                self.deploy(env_file=override)
+        run.assert_not_called()
+        self.assertFalse(self.manifest())
+        self.assertEqual(self.calls, [])
+
     def inspect(self, *selectors):
         compose = self.apps / 'demo/compose.yml'
         compose.parent.mkdir(exist_ok=True)
@@ -349,6 +414,24 @@ class DeployTests(unittest.TestCase):
         self.assertFalse(unused_state.exists())
         self.assertEqual(self.calls, [])
         return report.getvalue()
+
+    def test_inspect_can_override_the_default_compose_env(self):
+        project = self.apps / 'demo'
+        project.mkdir()
+        compose = project / 'compose.yml'
+        compose.write_text('ports: ["${BIND_IP}:8080:80"]\n')
+        (project / 'compose.env').write_text('BIND_IP=127.0.0.1\n')
+        override = self.base / 'production.env'
+        override.write_text('BIND_IP=0.0.0.0\n')
+        self.desired = {'web.container': quadlet('PublishPort=0.0.0.0:8080:80\n')}
+
+        with patch.object(appctl, 'run', side_effect=self.run_command) as run:
+            report = self.inspect('web', '--env-file', str(override))
+        self.assertEqual(run.call_args.args[-1], '-')
+        self.assertEqual(run.call_args.kwargs['input_text'], 'ports: ["0.0.0.0:8080:80"]\n')
+        self.assertIn('0.0.0.0:8080:80', report)
+        self.assertEqual(appctl.parse_args(['--env-file', 'production.env', 'deploy', 'demo']).env_file,
+                         Path('production.env'))
 
     def test_inspect_reports_declared_ports_and_mounts_for_all_services(self):
         self.desired = {

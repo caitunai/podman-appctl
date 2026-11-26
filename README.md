@@ -234,7 +234,7 @@ For multi-service projects, define an explicit shared Compose network if service
 ## Commands
 
 ```text
-appctl deploy APP [--pull] [--force]
+appctl deploy APP [--pull] [--force] [--env-file FILE]
 appctl start APP [SERVICE]
 appctl stop APP [SERVICE]
 appctl restart APP [SERVICE]
@@ -243,7 +243,7 @@ appctl list [APP [SERVICE]]
 appctl ps [APP [SERVICE]]
 appctl status APP [SERVICE]
 appctl stats APP [SERVICE] [--no-stream] [--interval SECONDS | --processes]
-appctl inspect APP [SERVICE]
+appctl inspect APP [SERVICE] [--env-file FILE]
 appctl logs APP [SERVICE] [-n N] [-f] [--since TIME] [--source journald|podman]
 appctl history APP [--limit N]
 appctl gc
@@ -343,6 +343,36 @@ appctl inspect myapp myapp-api    # One service
 `inspect` uses Podlet to read the current `compose.yml` and works before the first deployment. The port table distinguishes host mappings declared with `ports` from container ports declared with `expose`. It also indicates host networking. The mount table shows the source, container path, and configured options for named volumes, anonymous volumes, bind-mounted files or directories, tmpfs, and mounted secrets.
 
 The report reflects configuration declarations. Host ports assigned automatically by Podman and ports opened by the application at runtime depend on the running container. Use the same project and service names as with `deploy` and `status`.
+
+### Substitute values from compose.env
+
+Place `compose.env` next to the project's `compose.yml` to manage values such as bind addresses and image tags in one place:
+
+```dotenv
+BIND_IP=127.0.0.1
+IMAGE_TAG=1.4.0
+```
+
+```yaml
+services:
+  myapp:
+    image: "registry.example.com/team/myapp:${IMAGE_TAG}"
+    pull_policy: never
+    ports:
+      - "${BIND_IP}:8080:8080"
+```
+
+```bash
+appctl deploy myapp
+appctl inspect myapp --env-file ./staging.env
+appctl deploy myapp --env-file ./staging.env
+```
+
+`--env-file` selects a replacement for the default file. Relative paths are resolved from the current working directory. When the default file is absent, appctl passes the original Compose file to Podlet. A missing explicitly selected file or a missing variable in the selected file causes the command to fail.
+
+Use one `NAME=VALUE` assignment per line. Blank lines, comments, and single- or double-quoted file values are supported. appctl substitutes `${NAME}` once as YAML source text before Podlet reads it, so choose values that fit their YAML context. Use `$${NAME}` to preserve a literal `${NAME}`. Values come from the selected file. Use Compose's service-level `env_file:` to pass an entire file of runtime environment variables into a container.
+
+Run `deploy` after changing the file. If the resolved Quadlet changes, appctl updates the affected service. An edit to an unused variable leaves the deployment fingerprint unchanged.
 
 ### View container logs
 

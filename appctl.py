@@ -2,12 +2,12 @@
 # appctl V4.2 — Compose -> Podlet -> Quadlet -> systemd (Rootless Podman)
 #
 # Usage (run as the configured non-root deployment account):
-#   appctl deploy APP [--pull] [--force]
+#   appctl deploy APP [--pull] [--force] [--env-file FILE]
 #   appctl {start,stop,restart,status} APP [SERVICE]
 #   appctl remove APP [SERVICE] [--volumes] [--networks]
 #   appctl {list,ps} [APP [SERVICE]]
 #   appctl stats APP [SERVICE] [--no-stream] [--interval SECONDS | --processes]
-#   appctl inspect APP [SERVICE]
+#   appctl inspect APP [SERVICE] [--env-file FILE]
 #   appctl logs APP [SERVICE] [-n N] [-f] [--since TIME] [--source journald|podman]
 #   appctl history APP [--limit N]
 #   appctl gc
@@ -26,6 +26,7 @@
 # Features:
 #   * Reads APPCTL_BASE_DIR/APP/compose.yml; generates .container/.network/.volume
 #     via Podlet for APPCTL_PODMAN_VERSION. No podman compose up/down.
+#   * Substitutes ${NAME} from the project's compose.env or --env-file.
 #   * Immutable image tags: use local cache; --pull checks registry even if cached.
 #   * Per-service fingerprints: Quadlet, image ID, regular bind-mounted files,
 #     EnvironmentFile, and local Quadlet drop-ins. No recursive data-dir hashing.
@@ -205,12 +206,12 @@ def configure():
 
 def now(): return dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds')
 
-def run(*args, ok=(0,), capture=True, env=None):
+def run(*args, ok=(0,), capture=True, env=None, input_text=None):
     # Capture noisy tools even in normal mode; show success warnings and full
     # failure diagnostics. Query exit codes (e.g. not-found) are expected.
     if OUT.verbose: OUT.line('INFO', '$ ' + shlex.join(args))
     p = subprocess.run(args, text=True, errors='replace', stdout=subprocess.PIPE,
-                       stderr=subprocess.PIPE, env=env)
+                       stderr=subprocess.PIPE, env=env, input=input_text)
     if p.returncode not in ok:
         raise CommandError(args, p.returncode, p.stdout, p.stderr)
     if OUT.verbose and not capture and p.stdout: OUT.diagnostic(p.stdout, sys.stdout)
@@ -849,10 +850,60 @@ def compose_path(app):
     return compose
 
 
-def generate_quadlets(compose, directory):
+def read_compose_env(path):
+    values = {}
+    for number, line in enumerate(path.read_text(encoding='utf-8-sig').splitlines(), 1):
+        if not line.strip() or line.lstrip().startswith('#'):
+            continue
+        key, separator, raw = line.lstrip().removeprefix('export ').partition('=')
+        key = key.strip()
+        if not separator or not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', key):
+            fail(f'Expected NAME=VALUE in {path}:{number}')
+        value = raw.lstrip()
+        if value.startswith(('"', "'")):
+            try:
+                parts = shlex.split(value, comments=True)
+            except ValueError:
+                parts = []
+            if len(parts) != 1:
+                fail(f'Invalid quoted environment value in {path}:{number}')
+            value = parts[0]
+        else:
+            value = re.split(r'[ \t]+#', raw, maxsplit=1)[0].strip()
+        values[key] = value
+    return values
+
+
+def render_compose(compose, env_file):
+    source = env_file if env_file is not None else compose.with_name('compose.env')
+    if env_file is None and not source.exists() and not source.is_symlink():
+        return None
+    if not source.is_file():
+        fail(f'Compose environment file not found or not a regular file: {source}')
+    values = read_compose_env(source)
+    text = compose.read_text(encoding='utf-8')
+
+    def substitute(match):
+        sigil, name = match.groups()
+        if sigil == '$$':
+            return match.group()[1:]
+        if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', name):
+            line = text.count('\n', 0, match.start()) + 1
+            fail(f'Expected ${{NAME}} for Compose substitution in {compose}:{line}')
+        if name not in values:
+            fail(f'Compose variable {name} is missing from {source}')
+        return values[name]
+
+    rendered = re.sub(r'(\$\$?)\{([^}\r\n]*)\}', substitute, text)
+    return rendered if rendered != text else None
+
+
+def generate_quadlets(compose, directory, env_file=None):
+    rendered = render_compose(compose, env_file)
     run('podlet', '--podman-version', PODMAN_VERSION, '--file', directory,
         '--absolute-host-paths', str(compose.parent), '--install', '--wanted-by', 'default.target',
-        '--skip-services-check', 'compose', str(compose), capture=False)
+        '--skip-services-check', 'compose', str(compose) if rendered is None else '-',
+        capture=False, input_text=rendered)
     return {path.name: path for path in Path(directory).iterdir()}
 
 
@@ -868,7 +919,7 @@ def deploy(args, project, event):
     OUT.phase('[1/4] Generate & validate Quadlet')
     # Preflight all generated files and config sources before changing services.
     with tempfile.TemporaryDirectory(prefix='appctl-') as tmp:
-        desired_paths = generate_quadlets(compose, tmp)
+        desired_paths = generate_quadlets(compose, tmp, args.env_file)
         if not desired_paths or any(not p.is_file() or p.suffix not in TYPES for p in desired_paths.values()):
             fail('Unexpected Podlet output or no units')
         desired={f:metadata(p) for f,p in desired_paths.items()}
@@ -1480,7 +1531,7 @@ def container_mounts(fields):
 def show_compose_resources(args):
     compose = compose_path(args.app)
     with tempfile.TemporaryDirectory(prefix='appctl-inspect-') as tmp:
-        generated = generate_quadlets(compose, tmp)
+        generated = generate_quadlets(compose, tmp, args.env_file)
         services = {path.stem: path for path in generated.values()
                     if path.suffix == '.container' and path.is_file()}
         if not services:
@@ -1769,11 +1820,14 @@ def parse_args(argv=None):
         p.add_argument('--verbose','-v',action='store_true',default=default,help='Show child commands and detailed operation output')
         p.add_argument('--no-color',action='store_true',default=default,help='Disable ANSI colors')
     output_flags(parser, False)
+    env_help = 'Compose substitution file (default: compose.env next to compose.yml)'
+    parser.add_argument('--env-file', type=Path, metavar='FILE', help=env_help)
     subs=parser.add_subparsers(dest='command',required=True)
     p=subs.add_parser('deploy',help='Incrementally deploy a project from compose.yml')
     p.add_argument('app',help=f'Project directory under APPCTL_BASE_DIR (default: {DEFAULT_BASE_DIR})')
     p.add_argument('--pull',action='store_true',help='Check registry even for cached images')
     p.add_argument('--force',action='store_true',help='Restart all desired services')
+    p.add_argument('--env-file', type=Path, metavar='FILE', default=argparse.SUPPRESS, help=env_help)
     p = subs.add_parser('list', aliases=['ps'], help='List deployed services and their runtime states')
     p.set_defaults(command='list')
     p.add_argument('app', nargs='?', help='Project name (default: all deployed projects)')
@@ -1792,6 +1846,8 @@ def parse_args(argv=None):
         p.add_argument('app',help=f'Project directory under APPCTL_BASE_DIR (default: {DEFAULT_BASE_DIR})')
         scope = 'all services in compose.yml' if action == 'inspect' else 'all owned container services'
         p.add_argument('service', nargs='?', help=f'Compose service name (default: {scope})')
+        if action == 'inspect':
+            p.add_argument('--env-file', type=Path, metavar='FILE', default=argparse.SUPPRESS, help=env_help)
         if action == 'remove':
             p.add_argument('--volumes', action='store_true', help='Delete unused managed named volumes and their data')
             p.add_argument('--networks', action='store_true', help='Delete unused managed Podman networks')
@@ -1813,6 +1869,8 @@ def parse_args(argv=None):
     subs.add_parser('gc',help='Prune expired/excess history across all projects')
     for sub in dict.fromkeys(subs.choices.values()): output_flags(sub,argparse.SUPPRESS)
     args=parser.parse_args(argv)
+    if args.env_file is not None and args.command not in ('deploy', 'inspect'):
+        parser.error('--env-file is supported by deploy and inspect')
     if getattr(args,'limit',1)<1: parser.error('--limit must be positive')
     if args.command == 'logs' and args.lines < 0:
         parser.error('--lines must be non-negative')
