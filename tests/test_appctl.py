@@ -336,6 +336,46 @@ class DeployTests(unittest.TestCase):
         self.assertEqual(self.pulls, [pull, pull])
         self.assertEqual(self.calls, [])
 
+    def test_deploy_honors_platform_for_pulls_and_image_cache(self):
+        self.desired = {
+            'web.container': quadlet('PodmanArgs=--platform linux/amd64\n'),
+            'worker.container': quadlet('PodmanArgs=--platform=linux/amd64\n'),
+        }
+        image = 'docker.io/library/nginx:test'
+        platform = 'linux/arm64'
+        inspect_refs = []
+
+        def resolve(*cmd, **kwargs):
+            nonlocal platform
+            if cmd[:4] == ('podman', 'image', 'inspect', '--format'):
+                self.assertEqual(cmd[4], '{{.Id}} {{.Os}}/{{.Architecture}}')
+                inspect_refs.append(cmd[5])
+                return SimpleNamespace(stdout=f'sha256:test-image {platform}\n')
+            if cmd[:2] == ('podman', 'pull'):
+                platform = cmd[cmd.index('--platform') + 1]
+            return self.run_command(*cmd, **kwargs)
+
+        with patch.object(appctl, 'run', side_effect=resolve):
+            self.assertEqual(self.deploy(), 'success')
+            pull = ('podman', 'pull', '--quiet', '--platform', 'linux/amd64', image)
+            self.assertEqual(self.pulls, [pull])
+            self.assertEqual(inspect_refs, [image, 'sha256:test-image'])
+            self.assertEqual(self.deploy(), 'noop')
+            self.assertEqual(self.pulls, [pull])
+            self.assertEqual(self.deploy(pull=True), 'noop')
+            self.assertEqual(self.pulls, [pull, pull])
+
+    def test_deploy_rejects_unknown_flags_appended_to_platform(self):
+        self.desired = {'web.container': quadlet('PodmanArgs=--platform linux/amd64 --pull always\n')}
+        self.image_cached = False
+
+        with self.assertRaisesRegex(appctl.DeployError, 'Unsupported PodmanArgs in web.container'):
+            self.deploy()
+
+        self.assertEqual(self.pulls, [])
+        self.assertEqual(self.calls, [])
+        self.assertFalse(self.manifest())
+
     def test_deploy_reads_compose_env_and_restarts_when_rendered_values_change(self):
         project = self.apps / 'demo'
         project.mkdir()
@@ -399,6 +439,27 @@ class DeployTests(unittest.TestCase):
         run.assert_not_called()
         self.assertFalse(self.manifest())
         self.assertEqual(self.calls, [])
+
+    def test_compose_env_expands_required_values_and_defaults(self):
+        compose = self.base / 'compose.yml'
+        source = self.base / 'compose.env'
+        compose.write_text(
+            'image: "${PHP81_IMAGE:?Set PHP81_IMAGE in compose.env}"\n'
+            'ports: ["${HOST_PRIVATE_IP:-127.0.0.1}:${FPM_PORT:-9000}:9000"]\n'
+            'environment: {OPTIONAL: "${EMPTY-default}", REQUIRED: "${EMPTY?Set EMPTY}"}\n'
+        )
+        source.write_text('PHP81_IMAGE=registry.example.com/octane:1.0\nFPM_PORT=\nEMPTY=\n')
+        self.assertEqual(
+            appctl.render_compose(compose, None),
+            'image: "registry.example.com/octane:1.0"\nports: ["127.0.0.1:9000:9000"]\n'
+            'environment: {OPTIONAL: "", REQUIRED: ""}\n',
+        )
+        source.write_text('FPM_PORT=9001\nEMPTY=\n')
+        with self.assertRaisesRegex(appctl.DeployError, r'PHP81_IMAGE is missing.*Set PHP81_IMAGE'):
+            appctl.render_compose(compose, None)
+        source.write_text('PHP81_IMAGE=\nFPM_PORT=9001\nEMPTY=\n')
+        with self.assertRaisesRegex(appctl.DeployError, r'PHP81_IMAGE is empty.*Set PHP81_IMAGE'):
+            appctl.render_compose(compose, None)
 
     def inspect(self, *selectors):
         compose = self.apps / 'demo/compose.yml'

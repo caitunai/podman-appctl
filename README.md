@@ -368,9 +368,20 @@ appctl inspect myapp --env-file ./staging.env
 appctl deploy myapp --env-file ./staging.env
 ```
 
-`--env-file` selects a replacement for the default file. Relative paths are resolved from the current working directory. When the default file is absent, appctl passes the original Compose file to Podlet. A missing explicitly selected file or a missing variable in the selected file causes the command to fail.
+`--env-file` selects a replacement for the default file. Relative paths are resolved from the current working directory. When the default file is absent, appctl passes the original Compose file to Podlet. A missing explicitly selected file causes the command to fail.
 
-Use one `NAME=VALUE` assignment per line. Blank lines, comments, and single- or double-quoted file values are supported. appctl substitutes `${NAME}` once as YAML source text before Podlet reads it, so choose values that fit their YAML context. Use `$${NAME}` to preserve a literal `${NAME}`. Values come from the selected file. Use Compose's service-level `env_file:` to pass an entire file of runtime environment variables into a container.
+Use one `NAME=VALUE` assignment per line. Blank lines, comments, and single- or double-quoted file values are supported. appctl substitutes values once as YAML source text before Podlet reads it, so choose values that fit their YAML context. Values come from the selected file.
+
+| Expression | Behavior |
+| --- | --- |
+| `${NAME}` | Use the value and fail if the variable is unset. |
+| `${NAME:-default}` | Use the default when the variable is unset or empty. |
+| `${NAME-default}` | Use the default when the variable is unset. |
+| `${NAME:?message}` | Show the message and fail when the variable is unset or empty. |
+| `${NAME?message}` | Show the message and fail when the variable is unset. |
+| `$${NAME}` | Preserve a literal `${NAME}`. |
+
+Use Compose's service-level `env_file:` to pass an entire file of runtime environment variables into a container.
 
 Run `deploy` after changing the file. If the resolved Quadlet changes, appctl updates the affected service. An edit to an unused variable leaves the deployment fingerprint unchanged.
 
@@ -441,6 +452,8 @@ Configuration file names are not restricted to `.app.toml` or `.env`. Files such
 Configuration changes are detected **when `appctl deploy` runs**; appctl is not a file watcher. For unchanged definitions, no `daemon-reload` is required merely because a mounted configuration file or image ID changed.
 
 Use `pull_policy: never` explicitly in each Compose service. appctl resolves images before starting services and prevents implicit registry pulls during systemd startup. Prefer versioned image references; if a mutable tag has been updated, use `--pull` to refresh it.
+
+Services can specify a Linux image platform in `linux/ARCH` form, such as `platform: linux/amd64`. appctl checks the cached image's platform and passes the same platform to `podman pull` when it needs to fetch the image.
 
 When definitions change, appctl checks the candidate Quadlets with the Podman generator in a temporary directory. It verifies that systemd loads the expected units before stopping removed services. Updates follow the loaded systemd dependency order, and deployment success requires all desired services to be active with the expected images.
 

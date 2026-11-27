@@ -322,11 +322,21 @@ def literal(s, label):
     if not NAME.fullmatch(s): fail(f'Unsupported static {label}: {s}')
     return s
 
+def container_platform(fields, filename):
+    if 'PodmanArgs' not in fields:
+        return ''
+    args = one(fields, 'PodmanArgs')
+    platform = re.fullmatch(r'--platform(?:=|[ \t]+)(linux/[a-z0-9]+)', args)
+    if not platform:
+        fail(f'Unsupported PodmanArgs in {filename}; expected --platform linux/ARCH')
+    return platform[1]
+
+
 def metadata(path):
     group, key, suffix = TYPES[path.suffix]
     parsed = parse(path); fields = parsed.get(group, {})
     if not fields: fail(f'Missing [{group}] in {path.name}')
-    if any(k in fields for k in ('GlobalArgs','PodmanArgs','Pod')):
+    if 'GlobalArgs' in fields or 'Pod' in fields or (group != 'Container' and 'PodmanArgs' in fields):
         fail(f'Unsupported raw arguments or pod in {path.name}')
     if any(k in parsed.get('Install', {}) for k in ('Alias',)):
         fail(f'Custom unit alias unsupported in {path.name}')
@@ -334,6 +344,7 @@ def metadata(path):
     unitbase = literal(one(fields, 'ServiceName', stem+suffix), 'unit name')
     resource = literal(one(fields,key,'systemd-'+(unitbase if group=='Container' else stem)), 'resource name')
     if group == 'Container':
+        container_platform(fields, path.name)
         if one(parsed.get('Service',{}),'Type') == 'oneshot': fail('Oneshot unsupported')
         image = one(fields,'Image')
         if not image or any(c.isspace() for c in image) or '%' in image or image.endswith(('.image','.build')):
@@ -777,6 +788,34 @@ def running_image(container, image_id):
                 container.get('Image', '').removeprefix('sha256:') == image_id.removeprefix('sha256:'))
 
 
+def resolve_image(image, platform, refresh, event):
+    def inspect_image(reference):
+        fmt = '{{.Id}} {{.Os}}/{{.Architecture}}' if platform else '{{.Id}}'
+        output = run('podman', 'image', 'inspect', '--format', fmt, reference).stdout.strip()
+        image_id, _, detected = output.partition(' ')
+        return image_id if not platform or detected == platform else ''
+
+    if not refresh and exists('image', image):
+        image_id = inspect_image(image)
+        if image_id:
+            event('image_cached', image=image)
+            return image_id
+        if not platform:
+            fail(f'Empty image ID: {image}')
+    OUT.line('PULL', short_image(image))
+    # podman pull defaults to always, including versions without --policy.
+    options = ('--platform', platform) if platform else ()
+    result = run('podman', 'pull', '--quiet', *options, image, capture=False)
+    reference = result.stdout.strip() if platform else image
+    if not reference:
+        fail(f'Podman returned no image ID for {image} ({platform})')
+    image_id = inspect_image(reference)
+    if not image_id:
+        fail(f'Image {image} does not match platform {platform}' if platform else f'Empty image ID: {image}')
+    event('image_pulled', image=image)
+    return image_id
+
+
 def verify_services(containers, plans):
     units = loaded_units(containers)
     for filename, meta in containers.items():
@@ -884,15 +923,24 @@ def render_compose(compose, env_file):
     text = compose.read_text(encoding='utf-8')
 
     def substitute(match):
-        sigil, name = match.groups()
+        sigil, expression = match.groups()
         if sigil == '$$':
             return match.group()[1:]
-        if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', name):
+        parts = re.fullmatch(r'([A-Za-z_][A-Za-z0-9_]*)(?:(:?[-?])([^{}]*))?', expression)
+        if not parts:
             line = text.count('\n', 0, match.start()) + 1
-            fail(f'Expected ${{NAME}} for Compose substitution in {compose}:{line}')
-        if name not in values:
-            fail(f'Compose variable {name} is missing from {source}')
-        return values[name]
+            fail(f'Unsupported Compose substitution in {compose}:{line}; '
+                 'use ${NAME}, ${NAME:-default}, or ${NAME:?message}')
+        name, operator, operand = parts.groups()
+        value = values.get(name)
+        empty_is_missing = operator in (':-', ':?')
+        if value is not None and (value != '' or not empty_is_missing):
+            return value
+        if operator in ('-', ':-'):
+            return operand
+        reason = f'empty in {source}' if value == '' else f'missing from {source}'
+        detail = f': {operand}' if operand else ''
+        fail(f'Compose variable {name} is {reason}{detail}')
 
     rendered = re.sub(r'(\$\$?)\{([^}\r\n]*)\}', substitute, text)
     return rendered if rendered != text else None
@@ -953,17 +1001,14 @@ def deploy(args, project, event):
         OUT.phase('[2/4] Resolve images & build deployment plan')
         plans={}; images={}; reload_needed=False
         for f,m in sorted(containers.items()):
-            p=desired_paths[f]; image=one(parse(p)['Container'],'Image')
-            if image not in images:
-                if args.pull or not exists('image',image):
-                    OUT.line('PULL', short_image(image))
-                    # podman pull defaults to always, including versions without --policy.
-                    run('podman', 'pull', '--quiet', image, capture=False)
-                    event('image_pulled',image=image)
-                else: event('image_cached',image=image)
-                images[image]=run('podman','image','inspect','--format','{{.Id}}',image).stdout.strip()
-                if not images[image]: fail('Empty image ID')
-            image_id=images[image]; inputs=fingerprint_inputs(p,image_id,dropin_changes); fp=hash_inputs(inputs)
+            p = desired_paths[f]
+            fields = parse(p)['Container']
+            image = one(fields, 'Image')
+            platform = container_platform(fields, f)
+            key = image, platform
+            if key not in images:
+                images[key] = resolve_image(image, platform, args.pull, event)
+            image_id=images[key]; inputs=fingerprint_inputs(p,image_id,dropin_changes); fp=hash_inputs(inputs)
             obj=inspect_container(m['resource']); info=unit_info(m['unit'])
             running = info.get('ActiveState') == 'active' and running_image(obj, image_id)
             prev=state.get(f,{})
